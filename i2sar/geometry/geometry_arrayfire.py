@@ -710,13 +710,15 @@ def geo2rdr_arrayfire_core(
             af, look_side_right
         )
     else:
-        sat_pos_x_af = af.constant(float(satellite_position[0]), n_points, dtype=af.Dtype.f64)
-        sat_pos_y_af = af.constant(float(satellite_position[1]), n_points, dtype=af.Dtype.f64)
-        sat_pos_z_af = af.constant(float(satellite_position[2]), n_points, dtype=af.Dtype.f64)
+        ctx = Geo2RdrGpuContext(af)
         
-        vel_x_af = af.constant(float(velocity[0]), n_points, dtype=af.Dtype.f64)
-        vel_y_af = af.constant(float(velocity[1]), n_points, dtype=af.Dtype.f64)
-        vel_z_af = af.constant(float(velocity[2]), n_points, dtype=af.Dtype.f64)
+        sat_pos_x_af = ctx.get_constant('sat_x', float(satellite_position[0]), n_points)
+        sat_pos_y_af = ctx.get_constant('sat_y', float(satellite_position[1]), n_points)
+        sat_pos_z_af = ctx.get_constant('sat_z', float(satellite_position[2]), n_points)
+        
+        vel_x_af = ctx.get_constant('vel_x', float(velocity[0]), n_points)
+        vel_y_af = ctx.get_constant('vel_y', float(velocity[1]), n_points)
+        vel_z_af = ctx.get_constant('vel_z', float(velocity[2]), n_points)
         
         dr_x = x_ecef_af - sat_pos_x_af
         dr_y = y_ecef_af - sat_pos_y_af
@@ -725,7 +727,7 @@ def geo2rdr_arrayfire_core(
         slant_range_af = af.sqrt(dr_x * dr_x + dr_y * dr_y + dr_z * dr_z)
         
         mid_time = float(radar_grid.start_time + radar_grid.number_of_seconds / 2.0)
-        aztime_af = af.constant(mid_time, n_points, dtype=af.Dtype.f64)
+        aztime_af = ctx.get_constant('mid_time', mid_time, n_points)
         
         cross_x_af = dr_y * vel_z_af - dr_z * vel_y_af
         cross_y_af = dr_z * vel_x_af - dr_x * vel_z_af
@@ -740,13 +742,15 @@ def geo2rdr_arrayfire_core(
         else:
             valid_mask_af = ~is_right_side_af
         
-        fdop_af = af.constant(0.5 * wavelength_m * doppler, n_points, dtype=af.Dtype.f64)
+        fdop_val = 0.5 * wavelength_m * doppler
+        fdop_af = ctx.get_constant('fdop', fdop_val, n_points)
+        
         vel_dot_vel = vel_x_af * vel_x_af + vel_y_af * vel_y_af + vel_z_af * vel_z_af
         c1_af = -vel_dot_vel
         
         dt_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
         
-        for _ in range(max_iterations):
+        for iteration in range(max_iterations):
             aztime_af = aztime_af - dt_af
             
             dopfact_af = dr_x * vel_x_af + dr_y * vel_y_af + dr_z * vel_z_af
@@ -759,15 +763,19 @@ def geo2rdr_arrayfire_core(
             dt_af = af.select(valid_mask_af, dt_af, 0.0)
             
             af.eval(dt_af)
-            max_dt = float(af.max(af.abs(dt_af)))
-            if max_dt < threshold:
-                break
+            
+            if iteration % 5 == 0 or iteration == max_iterations - 1:
+                max_dt = float(af.max(af.abs(dt_af)))
+                if max_dt < threshold:
+                    break
         
         af.eval(aztime_af, slant_range_af)
         af.sync()
         
         aztime_np = to_numpy(aztime_af)
         range_np = to_numpy(slant_range_af)
+        
+        ctx.clear_cache()
         
         result = np.stack([aztime_np, range_np], axis=0)
         
@@ -782,7 +790,8 @@ def _geo2rdr_arrayfire_with_orbit(
     n_points: int, radar_grid: RadarGrid,
     orbit: OrbitInterpolator, doppler: float,
     wavelength_m: float, max_iterations: int,
-    threshold: float, af
+    threshold: float, af,
+    look_side_right: bool = True
 ) -> np.ndarray:
     t_az_af = af.constant(
         radar_grid.start_time + radar_grid.number_of_seconds / 2.0,
@@ -792,53 +801,24 @@ def _geo2rdr_arrayfire_with_orbit(
     fdop_val = 0.5 * wavelength_m * doppler
     fdop_af = af.constant(fdop_val, n_points, dtype=af.Dtype.f64)
     
-    for iteration in range(max_iterations):
-        t_az_np = to_numpy(t_az_af)
-        
-        orbit_state = orbit.state_at(t_az_np, allow_extrapolation=True)
-        sat_pos = orbit_state.position
-        sat_vel = orbit_state.velocity
-        
-        sat_x_af = asarray(af, sat_pos[:, 0])
-        sat_y_af = asarray(af, sat_pos[:, 1])
-        sat_z_af = asarray(af, sat_pos[:, 2])
-        vel_x_af = asarray(af, sat_vel[:, 0])
-        vel_y_af = asarray(af, sat_vel[:, 1])
-        vel_z_af = asarray(af, sat_vel[:, 2])
-        
-        dr_x = x_ecef_af - sat_x_af
-        dr_y = y_ecef_af - sat_y_af
-        dr_z = z_ecef_af - sat_z_af
-        
-        slant_range_af = af.sqrt(dr_x * dr_x + dr_y * dr_y + dr_z * dr_z)
-        
-        dot_dr_vel = dr_x * vel_x_af + dr_y * vel_y_af + dr_z * vel_z_af
-        
-        fn = dot_dr_vel - fdop_af * slant_range_af
-        
-        vel_mag_sq = vel_x_af * vel_x_af + vel_y_af * vel_y_af + vel_z_af * vel_z_af
-        c1 = -vel_mag_sq
-        c2 = fdop_af / slant_range_af
-        fnprime = c1 + c2 * dot_dr_vel
-        
-        dt_af = af.select(fnprime != 0, fn / fnprime, 0.0)
-        
-        t_az_af = t_az_af - dt_af
-        
-        converged = af.abs(dt_af) < threshold
-        converged_sum = af.sum(converged)
-        converged_all = converged_sum >= af.constant(n_points, 1, dtype=af.Dtype.f64)
-        
-        if bool(to_numpy(converged_all)[0]):
-            break
+    sat_x_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
+    sat_y_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
+    sat_z_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
+    vel_x_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
+    vel_y_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
+    vel_z_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
     
     t_az_np = to_numpy(t_az_af)
     orbit_state = orbit.state_at(t_az_np, allow_extrapolation=True)
     sat_pos = orbit_state.position
+    sat_vel = orbit_state.velocity
     
-    sat_x_af = asarray(af, sat_pos[:, 0])
-    sat_y_af = asarray(af, sat_pos[:, 1])
-    sat_z_af = asarray(af, sat_pos[:, 2])
+    af.write(sat_x_af, asarray(af, sat_pos[:, 0]))
+    af.write(sat_y_af, asarray(af, sat_pos[:, 1]))
+    af.write(sat_z_af, asarray(af, sat_pos[:, 2]))
+    af.write(vel_x_af, asarray(af, sat_vel[:, 0]))
+    af.write(vel_y_af, asarray(af, sat_vel[:, 1]))
+    af.write(vel_z_af, asarray(af, sat_vel[:, 2]))
     
     dr_x = x_ecef_af - sat_x_af
     dr_y = y_ecef_af - sat_y_af
@@ -846,7 +826,60 @@ def _geo2rdr_arrayfire_with_orbit(
     
     slant_range_af = af.sqrt(dr_x * dr_x + dr_y * dr_y + dr_z * dr_z)
     
-    af.eval(slant_range_af)
+    cross_x_af = dr_y * vel_z_af - dr_z * vel_y_af
+    cross_y_af = dr_z * vel_x_af - dr_x * vel_z_af
+    cross_z_af = dr_x * vel_y_af - dr_y * vel_x_af
+    
+    dot_product_af = cross_x_af * sat_x_af + cross_y_af * sat_y_af + cross_z_af * sat_z_af
+    is_right_side_af = dot_product_af > 0
+    
+    if look_side_right:
+        valid_mask_af = is_right_side_af
+    else:
+        valid_mask_af = ~is_right_side_af
+    
+    vel_mag_sq_af = vel_x_af * vel_x_af + vel_y_af * vel_y_af + vel_z_af * vel_z_af
+    c1_af = -vel_mag_sq_af
+    
+    for iteration in range(max_iterations):
+        dot_dr_vel = dr_x * vel_x_af + dr_y * vel_y_af + dr_z * vel_z_af
+        
+        c2_af = fdop_af / slant_range_af
+        fnprime_af = c1_af + c2_af * dot_dr_vel
+        
+        fn_af = dot_dr_vel - fdop_af * slant_range_af
+        
+        dt_af = af.select(fnprime_af != 0, fn_af / fnprime_af, 0.0)
+        dt_af = af.select(valid_mask_af, dt_af, 0.0)
+        
+        t_az_af = t_az_af - dt_af
+        
+        af.eval(dt_af)
+        
+        if iteration % 5 == 0 or iteration == max_iterations - 1:
+            max_dt = float(af.max(af.abs(dt_af)))
+            if max_dt < threshold:
+                break
+        
+        t_az_np = to_numpy(t_az_af)
+        orbit_state = orbit.state_at(t_az_np, allow_extrapolation=True)
+        sat_pos = orbit_state.position
+        sat_vel = orbit_state.velocity
+        
+        af.write(sat_x_af, asarray(af, sat_pos[:, 0]))
+        af.write(sat_y_af, asarray(af, sat_pos[:, 1]))
+        af.write(sat_z_af, asarray(af, sat_pos[:, 2]))
+        af.write(vel_x_af, asarray(af, sat_vel[:, 0]))
+        af.write(vel_y_af, asarray(af, sat_vel[:, 1]))
+        af.write(vel_z_af, asarray(af, sat_vel[:, 2]))
+        
+        dr_x = x_ecef_af - sat_x_af
+        dr_y = y_ecef_af - sat_y_af
+        dr_z = z_ecef_af - sat_z_af
+        
+        slant_range_af = af.sqrt(dr_x * dr_x + dr_y * dr_y + dr_z * dr_z)
+    
+    af.eval(t_az_af, slant_range_af)
     af.sync()
     
     aztime_np = to_numpy(t_az_af)
