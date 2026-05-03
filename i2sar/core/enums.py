@@ -14,7 +14,7 @@ class LookSide(StrEnum):
 
     @property
     def sign(self) -> int:
-        return 1 if self == LookSide.LEFT else -1
+        return 1 if self == LookSide.RIGHT else -1
 
     def __repr__(self) -> str:
         return f"LookSide.{self.name}"

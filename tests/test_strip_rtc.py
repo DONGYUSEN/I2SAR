@@ -8,7 +8,7 @@ import h5py
 import numpy as np
 
 from i2sar import Project
-from i2sar.core.enums import AcquisitionMode
+from i2sar.core.enums import AcquisitionMode, LookSide
 from i2sar.io.base import ImportResult, SourceRef
 from i2sar.model import SceneInfo
 
@@ -184,6 +184,57 @@ def test_run_strip_rtc_reuses_existing_imported_scene(monkeypatch, tmp_path):
     assert result.scene_h5_path == scene_path
 
 
+def test_compute_rtc_block_passes_look_side_to_rdr2geo_fast(monkeypatch):
+    from i2sar.geometry.radar_grid import RadarGrid
+    from i2sar.orbit import OrbitInterpolator
+    from i2sar.rtc import strip_rtc
+
+    calls = []
+
+    def fake_rdr2geo_fast(**kwargs):
+        calls.append(kwargs)
+        return np.array([[10.0], [20.0], [30.0]], dtype=np.float64)
+
+    monkeypatch.setattr(strip_rtc, "_check_arrayfire", lambda: True)
+    monkeypatch.setattr(strip_rtc, "rdr2geo_fast", fake_rdr2geo_fast)
+    monkeypatch.setattr(strip_rtc, "_compute_satellite_positions_at_aztimes", lambda az_times, orbit: np.zeros((1, 3)))
+    monkeypatch.setattr(strip_rtc, "_dem_gradient_arrays", lambda elevation, gt: (elevation, elevation))
+    monkeypatch.setattr(strip_rtc, "sample_dem_at_latlons", lambda lats, lons, elevation, gt: np.full_like(lats, 123.0))
+    monkeypatch.setattr(strip_rtc, "_compute_local_cos_incidence_vectorized", lambda *args: np.ones(1))
+
+    radar_grid = RadarGrid(
+        sensing_start_s=0.0,
+        prf_hz=1000.0,
+        starting_range_m=800000.0,
+        range_pixel_spacing_m=10.0,
+        length=1,
+        width=1,
+    )
+    orbit = OrbitInterpolator(
+        np.array([0.0, 1.0], dtype=np.float64),
+        np.array([[7000000.0, 0.0, 0.0], [7000000.0, 0.0, 0.0]], dtype=np.float64),
+        np.array([[0.0, 7000.0, 0.0], [0.0, 7000.0, 0.0]], dtype=np.float64),
+    )
+
+    strip_rtc._compute_rtc_block_vectorized(
+        block_rows=np.array([0.0]),
+        block_cols=np.array([0.0]),
+        radar_grid=radar_grid,
+        orbit=orbit,
+        doppler=0.0,
+        dem_elevation=np.zeros((2, 2), dtype=np.float32),
+        dem_geotransform=[19.0, 1.0, 0.0, 11.0, 0.0, -1.0],
+        slc_power=np.ones((1, 1), dtype=np.float32),
+        calibration_scale=1.0,
+        look_side=LookSide.LEFT,
+        use_gpu=True,
+    )
+
+    assert calls[0]["look_side"] is LookSide.LEFT
+    assert calls[1]["look_side"] is LookSide.LEFT
+    np.testing.assert_allclose(calls[1]["dem"], np.array([123.0]))
+
+
 def test_slc_block_to_power_uses_complex_magnitude_squared():
     from i2sar.rtc.strip_rtc import _slc_block_to_power
 
@@ -245,6 +296,20 @@ def test_rtc_metadata_filename_uses_satellite_and_acquisition_date(tmp_path):
     )
 
     assert _rtc_metadata_filename(scene_path, "strip_scene", {}) == "Tianyi_20231110_RTC.h5"
+
+
+def test_strip_rtc_output_resolution_uses_legacy_rounding_rule():
+    from i2sar.rtc.strip_rtc import _calculate_output_resolution
+
+    assert _calculate_output_resolution(2.0, 3.25) == 6.5
+    assert _calculate_output_resolution(2.1, 2.1) == 4.5
+
+
+def test_strip_rtc_utm_epsg_uses_hemisphere_and_zone():
+    from i2sar.rtc.strip_rtc import _get_utm_epsg
+
+    assert _get_utm_epsg(29.0, 94.0) == (32646, 46)
+    assert _get_utm_epsg(-29.0, 94.0) == (32746, 46)
 
 
 def test_process_strip_scene_rtc_writes_png_not_final_tif(tmp_path):

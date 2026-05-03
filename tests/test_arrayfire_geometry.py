@@ -1,5 +1,6 @@
 import numpy as np
 
+from i2sar.core.enums import LookSide
 from i2sar.accel.arrayfire_backend import arrayfire_available
 from i2sar.geometry import RadarGrid, WGS84, llh_to_ecef
 from i2sar.geometry.accelerated_geometry import geo2rdr_fast, rdr2geo_fast
@@ -75,7 +76,7 @@ def test_geo2rdr_arrayfire_matches_numpy_for_vectorized_static_orbit():
         satellite_position=sat_position,
         velocity=velocity,
         doppler=0.0,
-        use_bracket=False,
+        look_side=LookSide.LEFT,
     )
     actual = geo2rdr_arrayfire(
         lat=lats,
@@ -85,6 +86,7 @@ def test_geo2rdr_arrayfire_matches_numpy_for_vectorized_static_orbit():
         satellite_position=sat_position,
         velocity=velocity,
         doppler=0.0,
+        look_side=LookSide.LEFT,
     )
 
     assert actual.shape == expected.shape

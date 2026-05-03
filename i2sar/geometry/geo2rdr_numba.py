@@ -46,7 +46,7 @@ def _check_look_side(rvec, vel, pos):
 def _find_closest_aztime(target_ecef, sat_positions, sat_velocities, look_side_right):
     n_positions = len(sat_positions)
     r_closest = 1e16
-    t_closest = 0.0
+    idx_closest = 0
     
     for k in range(n_positions):
         pos = sat_positions[k]
@@ -61,15 +61,15 @@ def _find_closest_aztime(target_ecef, sat_positions, sat_velocities, look_side_r
         
         if r < r_closest:
             r_closest = r
-            t_closest = float(k) / (n_positions - 1)
+            idx_closest = k
     
-    return t_closest
+    return float(idx_closest)
 
 
 @njit(fastmath=True)
 def _geo2rdr_single_numba(
     lat, lon, height,
-    sat_positions, sat_velocities,
+    sat_positions, sat_velocities, sat_times,
     doppler, wavelength,
     a, b,
     max_iterations, threshold,
@@ -80,15 +80,26 @@ def _geo2rdr_single_numba(
     
     n_positions = len(sat_positions)
     
-    t_closest = _find_closest_aztime(target_ecef, sat_positions, sat_velocities, look_side_right)
-    t_az = sensing_start_s + t_closest * length / prf_hz
+    idx_closest = int(_find_closest_aztime(target_ecef, sat_positions, sat_velocities, look_side_right))
+    
+    if n_positions > 1:
+        t_az = sat_times[idx_closest]
+    else:
+        t_az = sensing_start_s + length / prf_hz / 2.0
     
     dt = 0.0
     
     for iteration in range(max_iterations):
         t_az = t_az - dt
         
-        idx = int(min(max(0, (t_az - sensing_start_s) * prf_hz / length * (n_positions - 1)), n_positions - 1))
+        if n_positions > 1:
+            t_min = sat_times[0]
+            t_max = sat_times[-1]
+            t_norm = (t_az - t_min) / (t_max - t_min) if (t_max - t_min) > 0 else 0.0
+            idx = int(min(max(0, t_norm * (n_positions - 1)), n_positions - 1))
+        else:
+            idx = 0
+        
         sat_pos_i = sat_positions[idx]
         vel_i = sat_velocities[idx]
         
@@ -113,7 +124,14 @@ def _geo2rdr_single_numba(
         if abs(dt) < threshold:
             break
     
-    idx = int(min(max(0, (t_az - sensing_start_s) * prf_hz / length * (n_positions - 1)), n_positions - 1))
+    if n_positions > 1:
+        t_min = sat_times[0]
+        t_max = sat_times[-1]
+        t_norm = (t_az - t_min) / (t_max - t_min) if (t_max - t_min) > 0 else 0.0
+        idx = int(min(max(0, t_norm * (n_positions - 1)), n_positions - 1))
+    else:
+        idx = 0
+    
     sat_pos_i = sat_positions[idx]
     rvec = target_ecef - sat_pos_i
     final_range = _norm(rvec)
@@ -124,7 +142,7 @@ def _geo2rdr_single_numba(
 @njit(parallel=True, fastmath=True)
 def geo2rdr_numba_parallel(
     lat_arr, lon_arr, h_arr,
-    sat_positions, sat_velocities,
+    sat_positions, sat_velocities, sat_times,
     doppler, wavelength,
     a, b,
     max_iterations, threshold,
@@ -153,7 +171,7 @@ def geo2rdr_numba_parallel(
         
         aztime, slant_range = _geo2rdr_single_numba(
             lat_rad, lon_rad, h_i,
-            sat_positions, sat_velocities,
+            sat_positions, sat_velocities, sat_times,
             doppler, wavelength,
             a, b,
             max_iterations, threshold,

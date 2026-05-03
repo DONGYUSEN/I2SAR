@@ -186,6 +186,33 @@ def _rdr2geo_single_numba(
     return np.array([final_llh[0], final_llh[1], final_llh[2]], dtype=np.float64)
 
 
+@njit(fastmath=True)
+def _interp_orbit_state(t_az, sat_times, sat_positions, sat_velocities):
+    n_orbit_points = len(sat_positions)
+    if n_orbit_points == 1:
+        return sat_positions[0], sat_velocities[0]
+
+    if t_az <= sat_times[0]:
+        return sat_positions[0], sat_velocities[0]
+    if t_az >= sat_times[n_orbit_points - 1]:
+        return sat_positions[n_orbit_points - 1], sat_velocities[n_orbit_points - 1]
+
+    lo = 0
+    hi = n_orbit_points - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if sat_times[mid] <= t_az:
+            lo = mid
+        else:
+            hi = mid
+
+    dt = sat_times[hi] - sat_times[lo]
+    weight = (t_az - sat_times[lo]) / dt if dt != 0.0 else 0.0
+    pos = sat_positions[lo] * (1.0 - weight) + sat_positions[hi] * weight
+    vel = sat_velocities[lo] * (1.0 - weight) + sat_velocities[hi] * weight
+    return pos, vel
+
+
 @njit(parallel=True, fastmath=True)
 def rdr2geo_numba_parallel(
     line_arr: np.ndarray,
@@ -194,6 +221,7 @@ def rdr2geo_numba_parallel(
     prf_hz: float,
     starting_range_m: float,
     range_pixel_spacing_m: float,
+    sat_times: np.ndarray,
     sat_positions: np.ndarray,
     sat_velocities: np.ndarray,
     doppler: float,
@@ -205,8 +233,6 @@ def rdr2geo_numba_parallel(
     max_iterations: int,
     extra_iterations: int,
     threshold: float,
-    orbit_start_time: float = 0.0,
-    orbit_duration: float = 100.0,
     length: int = 10000,
     width: int = 10000
 ):
@@ -214,8 +240,6 @@ def rdr2geo_numba_parallel(
     results_lat = np.full(n_points, np.nan)
     results_lon = np.full(n_points, np.nan)
     results_h = np.full(n_points, np.nan)
-
-    n_orbit_points = len(sat_positions)
 
     for i in prange(n_points):
         l_i = float(line_arr[i])
@@ -228,15 +252,7 @@ def rdr2geo_numba_parallel(
 
         t_az = sensing_start_s + l_i / prf_hz
 
-        if n_orbit_points == 1:
-            idx = 0
-        else:
-            t_rel = t_az - orbit_start_time
-            ratio = max(0.0, min(1.0, t_rel / orbit_duration))
-            idx = min(int(ratio * (n_orbit_points - 1)), n_orbit_points - 1)
-        
-        sat_pos_i = sat_positions[idx]
-        vel_i = sat_velocities[idx]
+        sat_pos_i, vel_i = _interp_orbit_state(t_az, sat_times, sat_positions, sat_velocities)
 
         slant_range = starting_range_m + p_i * range_pixel_spacing_m
 

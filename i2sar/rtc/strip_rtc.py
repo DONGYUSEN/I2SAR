@@ -33,7 +33,6 @@ from i2sar.io import import_scene
 from i2sar.io.base import ImportResult, SourceRef
 from i2sar.orbit import OrbitInterpolator
 from i2sar.project import Project
-from i2sar.rtc.rtc import _calculate_output_resolution, _get_utm_epsg
 
 AF_AVAILABLE = False
 
@@ -51,6 +50,26 @@ def _check_arrayfire() -> bool:
 
 DEFAULT_DEM_CACHE = Path("/home/ysdong/Temp/dem")
 NASADEM_SRTM_URL_TEMPLATE = "https://e4ftl01.cr.usgs.gov/MEASURES/NASADEM_HGT.001/2000.02.11/{tile}.hgt.zip"
+
+
+def _calculate_output_resolution(
+    range_spacing: float,
+    azimuth_spacing: float,
+) -> float:
+    max_spacing = max(range_spacing, azimuth_spacing)
+    base_res = max_spacing * 2.0
+    rounded = np.ceil(base_res * 2.0) / 2.0
+    return float(rounded)
+
+
+def _estimate_utm_zone(longitude: float) -> int:
+    return int(np.floor((longitude + 180.0) / 6.0) + 1)
+
+
+def _get_utm_epsg(latitude: float, longitude: float) -> Tuple[int, int]:
+    zone = _estimate_utm_zone(longitude)
+    epsg = 32600 + zone if latitude >= 0.0 else 32700 + zone
+    return epsg, zone
 
 
 @dataclass(frozen=True)
@@ -532,6 +551,29 @@ def _load_doppler_from_scene(scene_h5_path: Path) -> float:
         return doppler_data.get("doppler", 0.0)
 
 
+def _load_look_side_from_scene(scene_h5_path: Path) -> LookSide:
+    acq = _acquisition_payload(scene_h5_path)
+    raw = str(
+        acq.get("lookDirection")
+        or acq.get("look_side")
+        or acq.get("lookSide")
+        or LookSide.RIGHT.value
+    ).strip().lower()
+    if raw in ("left", "l"):
+        return LookSide.LEFT
+    if raw in ("right", "r"):
+        return LookSide.RIGHT
+    raise ValueError(f"unsupported look side in scene metadata: {raw!r}")
+
+
+def _load_wavelength_from_scene(scene_h5_path: Path) -> float:
+    acq = _acquisition_payload(scene_h5_path)
+    center_frequency = float(acq.get("centerFrequency", 0.0) or 0.0)
+    if center_frequency <= 0.0:
+        return 0.0565642
+    return 299792458.0 / center_frequency
+
+
 def _compute_rtc_block_vectorized(
     block_rows: np.ndarray,
     block_cols: np.ndarray,
@@ -543,6 +585,7 @@ def _compute_rtc_block_vectorized(
     slc_power: np.ndarray,
     calibration_scale: float,
     look_side: LookSide = LookSide.RIGHT,
+    wavelength_m: float = 0.0565642,
     use_dem: bool = True,
     use_gpu: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -553,7 +596,25 @@ def _compute_rtc_block_vectorized(
     flat_rows = row_grid.ravel()
     flat_cols = col_grid.ravel()
 
-    if use_gpu and _check_arrayfire():
+    method = "auto"
+    llh = rdr2geo_fast(
+        line=flat_rows,
+        pixel=flat_cols,
+        radar_grid=radar_grid,
+        satellite_position=orbit,
+        velocity=None,
+        doppler=doppler,
+        dem=0.0,
+        method=method,
+        look_side=look_side,
+        wavelength_m=wavelength_m,
+    )
+
+    lat = llh[0].reshape(n_rows, n_cols)
+    lon = llh[1].reshape(n_rows, n_cols)
+
+    if use_dem:
+        dem_height = sample_dem_at_latlons(lat.ravel(), lon.ravel(), dem_elevation, dem_geotransform)
         llh = rdr2geo_fast(
             line=flat_rows,
             pixel=flat_cols,
@@ -561,29 +622,17 @@ def _compute_rtc_block_vectorized(
             satellite_position=orbit,
             velocity=None,
             doppler=doppler,
-            dem=0.0,
-            method="arrayfire",
-        )
-    else:
-        from i2sar.geometry.rdr2geo import rdr2geo_parallel
-        llh = rdr2geo_parallel(
-            line=flat_rows,
-            pixel=flat_cols,
-            radar_grid=radar_grid,
-            satellite_position=orbit,
-            velocity=None,
-            doppler=doppler,
-            dem=0.0,
+            dem=dem_height,
+            method=method,
+            look_side=look_side,
+            wavelength_m=wavelength_m,
         )
 
     lat = llh[0].reshape(n_rows, n_cols)
     lon = llh[1].reshape(n_rows, n_cols)
     height = llh[2].reshape(n_rows, n_cols)
 
-    if use_dem:
-        dem_height = sample_dem_at_latlons(lat.ravel(), lon.ravel(), dem_elevation, dem_geotransform)
-        height = dem_height.reshape(n_rows, n_cols)
-    else:
+    if not use_dem:
         height = llh[2].reshape(n_rows, n_cols)
         height = np.clip(height, 0, 9000)
 
@@ -630,6 +679,8 @@ def _write_physical_rtc_radar_geotiff(
     elevation, _, dem_geotransform = read_dem_from_hdf5(dem_h5_path)
     orbit = _load_orbit_from_scene(scene_h5_path)
     doppler = _load_doppler_from_scene(scene_h5_path)
+    look_side = _load_look_side_from_scene(scene_h5_path)
+    wavelength_m = _load_wavelength_from_scene(scene_h5_path)
     
     driver = gdal.GetDriverByName("GTiff")
     out_ds = driver.Create(
@@ -669,6 +720,8 @@ def _write_physical_rtc_radar_geotiff(
             dem_geotransform=dem_geotransform,
             slc_power=slc_power,
             calibration_scale=calibration_scale,
+            look_side=look_side,
+            wavelength_m=wavelength_m,
             use_gpu=use_gpu,
         )
         

@@ -102,30 +102,37 @@ class OrbitInterpolator:
         
         t = query
         t0 = self.time[indices]
-        h = self.time[indices + 1] - t0
-        u = (t - t0) / h
+        dt = t - t0
         
-        u2 = u * u
-        u3 = u2 * u
-        
-        idx = indices if query.ndim == 0 else indices[:, np.newaxis]
-        
-        pos = (
-            self.hermite_c0[idx]
-            + self.hermite_c1[idx] * (t - t0)
-            + self.hermite_c2[idx] * (t - t0)**2
-            + self.hermite_c3[idx] * (t - t0)**3
-        )
-        
-        vel = (
-            self.hermite_c1[idx]
-            + 2 * self.hermite_c2[idx] * (t - t0)
-            + 3 * self.hermite_c3[idx] * (t - t0)**2
-        )
+        dt_2 = dt * dt
+        dt_3 = dt_2 * dt
         
         if query.ndim == 0:
-            pos = pos.reshape(3)
-            vel = vel.reshape(3)
+            idx = int(indices)
+            pos = (
+                self.hermite_c0[idx]
+                + self.hermite_c1[idx] * dt
+                + self.hermite_c2[idx] * dt_2
+                + self.hermite_c3[idx] * dt_3
+            )
+            vel = (
+                self.hermite_c1[idx]
+                + 2 * self.hermite_c2[idx] * dt
+                + 3 * self.hermite_c3[idx] * dt_2
+            )
+        else:
+            idx = indices
+            pos = (
+                self.hermite_c0[idx]
+                + self.hermite_c1[idx] * dt[:, np.newaxis]
+                + self.hermite_c2[idx] * dt_2[:, np.newaxis]
+                + self.hermite_c3[idx] * dt_3[:, np.newaxis]
+            )
+            vel = (
+                self.hermite_c1[idx]
+                + 2 * self.hermite_c2[idx] * dt[:, np.newaxis]
+                + 3 * self.hermite_c3[idx] * dt_2[:, np.newaxis]
+            )
         
         return pos, vel
 
@@ -213,6 +220,35 @@ class OrbitInterpolator:
             velocity = _interp_vectors(query, self.time, self.velocity)
         
         return OrbitState(position=position, velocity=velocity)
+
+    def state_at_many(self, times: np.ndarray, *, allow_extrapolation: bool = False) -> tuple[np.ndarray, np.ndarray]:
+        """批量插值接口，返回位置和速度数组
+        
+        Args:
+            times: 形状为 (N,) 的时间数组
+            allow_extrapolation: 是否允许外推
+        
+        Returns:
+            (positions, velocities): 形状分别为 (N, 3) 的位置和速度数组
+        """
+        query = np.asarray(times, dtype=np.float64)
+        if query.ndim != 1:
+            raise ValueError("times must be a 1-dimensional array")
+        
+        if not allow_extrapolation:
+            outside = (query < self.time[0]) | (query > self.time[-1])
+            if bool(np.any(outside)):
+                raise ValueError("some query times are outside orbit time span")
+
+        if self.method == OrbitInterpMethod.HERMITE:
+            positions, velocities = self._hermite_interpolate(query)
+        elif self.method == OrbitInterpMethod.LEGENDRE:
+            positions, velocities = self._legendre_interpolate(query)
+        else:
+            positions = _interp_vectors(query, self.time, self.position)
+            velocities = _interp_vectors(query, self.time, self.velocity)
+        
+        return positions, velocities
 
 
 def _interp_vectors(query: np.ndarray, time: np.ndarray, values: np.ndarray) -> np.ndarray:

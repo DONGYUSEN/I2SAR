@@ -63,39 +63,73 @@ def rdr2geo_arrayfire_optimized(
     
     sat = np.asarray(satellite_position, dtype=np.float64)
     vel = np.asarray(velocity, dtype=np.float64)
-    sx, sy, sz = float(sat[0]), float(sat[1]), float(sat[2])
-    vx, vy, vz = float(vel[0]), float(vel[1]), float(vel[2])
+    per_point_state = sat.ndim == 2
+    if per_point_state:
+        sx_np = sat[:, 0]
+        sy_np = sat[:, 1]
+        sz_np = sat[:, 2]
+        vx_np = vel[:, 0]
+        vy_np = vel[:, 1]
+        vz_np = vel[:, 2]
+    else:
+        sx, sy, sz = float(sat[0]), float(sat[1]), float(sat[2])
+        vx, vy, vz = float(vel[0]), float(vel[1]), float(vel[2])
     
     slant_range = radar_grid.starting_range_m + pixel_arr * radar_grid.range_pixel_spacing_m
-    vmag = float(np.linalg.norm(vel))
-    vhat = vel / vmag
-    
-    pos_norm = float(np.linalg.norm(sat))
-    nx, ny, nz = -sx / pos_norm, -sy / pos_norm, -sz / pos_norm
-    
-    cx = ny * vz - nz * vy
-    cy = nz * vx - nx * vz
-    cz = nx * vy - ny * vx
-    c_norm = float(np.sqrt(cx * cx + cy * cy + cz * cz))
-    if c_norm < 1e-10:
-        tx, ty, tz = 1.0, 0.0, 0.0
-        cx, cy, cz = 0.0, 1.0, 0.0
+    if per_point_state:
+        vmag_np = np.linalg.norm(vel, axis=1)
+        vhat_np = vel / vmag_np[:, np.newaxis]
+        pos_norm_np = np.linalg.norm(sat, axis=1)
+        nx_np, ny_np, nz_np = -sx_np / pos_norm_np, -sy_np / pos_norm_np, -sz_np / pos_norm_np
+        cx_np = ny_np * vz_np - nz_np * vy_np
+        cy_np = nz_np * vx_np - nx_np * vz_np
+        cz_np = nx_np * vy_np - ny_np * vx_np
+        c_norm_np = np.sqrt(cx_np * cx_np + cy_np * cy_np + cz_np * cz_np)
+        mask = c_norm_np < 1e-10
+        c_norm_safe = np.where(mask, 1.0, c_norm_np)
+        cx_np, cy_np, cz_np = cx_np / c_norm_safe, cy_np / c_norm_safe, cz_np / c_norm_safe
+        cx_np = np.where(mask, 0.0, cx_np)
+        cy_np = np.where(mask, 1.0, cy_np)
+        cz_np = np.where(mask, 0.0, cz_np)
+        tx_np = cy_np * nz_np - cz_np * ny_np
+        ty_np = cz_np * nx_np - cx_np * nz_np
+        tz_np = cx_np * ny_np - cy_np * nx_np
+        tx_np = np.where(mask, 1.0, tx_np)
+        ty_np = np.where(mask, 0.0, ty_np)
+        tz_np = np.where(mask, 0.0, tz_np)
+        t_norm_np = np.sqrt(tx_np * tx_np + ty_np * ty_np + tz_np * tz_np)
+        tx_np, ty_np, tz_np = tx_np / t_norm_np, ty_np / t_norm_np, tz_np / t_norm_np
+        n_dot_v_np = nx_np * vhat_np[:, 0] + ny_np * vhat_np[:, 1] + nz_np * vhat_np[:, 2]
+        v_dot_t_np = vhat_np[:, 0] * tx_np + vhat_np[:, 1] * ty_np + vhat_np[:, 2] * tz_np
+        dopfact = 0.5 * wavelength_m * float(doppler) * slant_range / vmag_np
+        eta = 1.0 / np.sqrt((sx_np / ellipsoid.a) ** 2 + (sy_np / ellipsoid.a) ** 2 + (sz_np / ellipsoid.b) ** 2)
+        radius_np = eta * pos_norm_np
+        height_np = (1.0 - eta) * pos_norm_np
     else:
-        cx, cy, cz = cx / c_norm, cy / c_norm, cz / c_norm
-        tx = cy * nz - cz * ny
-        ty = cz * nx - cx * nz
-        tz = cx * ny - cy * nx
-        t_norm = float(np.sqrt(tx * tx + ty * ty + tz * tz))
-        tx, ty, tz = tx / t_norm, ty / t_norm, tz / t_norm
-    
-    n_dot_v = nx * vhat[0] + ny * vhat[1] + nz * vhat[2]
-    v_dot_t = vhat[0] * tx + vhat[1] * ty + vhat[2] * tz
-    dopfact = 0.5 * wavelength_m * float(doppler) * slant_range / vmag
-    
-    minor = ellipsoid.b
-    eta = 1.0 / np.sqrt((sx / ellipsoid.a) ** 2 + (sy / ellipsoid.a) ** 2 + (sz / minor) ** 2)
-    radius = eta * pos_norm
-    height = (1.0 - eta) * pos_norm
+        vmag = float(np.linalg.norm(vel))
+        vhat = vel / vmag
+        pos_norm = float(np.linalg.norm(sat))
+        nx, ny, nz = -sx / pos_norm, -sy / pos_norm, -sz / pos_norm
+        cx = ny * vz - nz * vy
+        cy = nz * vx - nx * vz
+        cz = nx * vy - ny * vx
+        c_norm = float(np.sqrt(cx * cx + cy * cy + cz * cz))
+        if c_norm < 1e-10:
+            tx, ty, tz = 1.0, 0.0, 0.0
+            cx, cy, cz = 0.0, 1.0, 0.0
+        else:
+            cx, cy, cz = cx / c_norm, cy / c_norm, cz / c_norm
+            tx = cy * nz - cz * ny
+            ty = cz * nx - cx * nz
+            tz = cx * ny - cy * nx
+            t_norm = float(np.sqrt(tx * tx + ty * ty + tz * tz))
+            tx, ty, tz = tx / t_norm, ty / t_norm, tz / t_norm
+        n_dot_v = nx * vhat[0] + ny * vhat[1] + nz * vhat[2]
+        v_dot_t = vhat[0] * tx + vhat[1] * ty + vhat[2] * tz
+        dopfact = 0.5 * wavelength_m * float(doppler) * slant_range / vmag
+        eta = 1.0 / np.sqrt((sx / ellipsoid.a) ** 2 + (sy / ellipsoid.a) ** 2 + (sz / ellipsoid.b) ** 2)
+        radius = eta * pos_norm
+        height = (1.0 - eta) * pos_norm
     
     ctx = Rdr2GeoGpuContext(af)
     
@@ -103,23 +137,34 @@ def rdr2geo_arrayfire_optimized(
     dopfact_af = asarray(af, dopfact)
     dem_af = asarray(af, dem_heights)
     
-    sx_af = ctx.get_constant('sx', sx, n_points)
-    sy_af = ctx.get_constant('sy', sy, n_points)
-    sz_af = ctx.get_constant('sz', sz, n_points)
-    tx_af = ctx.get_constant('tx', tx, n_points)
-    ty_af = ctx.get_constant('ty', ty, n_points)
-    tz_af = ctx.get_constant('tz', tz, n_points)
-    cx_af = ctx.get_constant('cx', cx, n_points)
-    cy_af = ctx.get_constant('cy', cy, n_points)
-    cz_af = ctx.get_constant('cz', cz, n_points)
-    nx_af = ctx.get_constant('nx', nx, n_points)
-    ny_af = ctx.get_constant('ny', ny, n_points)
-    nz_af = ctx.get_constant('nz', nz, n_points)
-    
-    pos_norm_af = ctx.get_constant('pos_norm', pos_norm, n_points)
-    radius_af = ctx.get_constant('radius', radius, n_points)
-    n_dot_v_af = ctx.get_constant('n_dot_v', n_dot_v, n_points)
-    v_dot_t_af = ctx.get_constant('v_dot_t', v_dot_t, n_points)
+    if per_point_state:
+        sx_af, sy_af, sz_af = asarray(af, sx_np), asarray(af, sy_np), asarray(af, sz_np)
+        tx_af, ty_af, tz_af = asarray(af, tx_np), asarray(af, ty_np), asarray(af, tz_np)
+        cx_af, cy_af, cz_af = asarray(af, cx_np), asarray(af, cy_np), asarray(af, cz_np)
+        nx_af, ny_af, nz_af = asarray(af, nx_np), asarray(af, ny_np), asarray(af, nz_np)
+        pos_norm_af = asarray(af, pos_norm_np)
+        radius_af = asarray(af, radius_np)
+        n_dot_v_af = asarray(af, n_dot_v_np)
+        v_dot_t_af = asarray(af, v_dot_t_np)
+        h_af = asarray(af, height_np)
+    else:
+        sx_af = ctx.get_constant('sx', sx, n_points)
+        sy_af = ctx.get_constant('sy', sy, n_points)
+        sz_af = ctx.get_constant('sz', sz, n_points)
+        tx_af = ctx.get_constant('tx', tx, n_points)
+        ty_af = ctx.get_constant('ty', ty, n_points)
+        tz_af = ctx.get_constant('tz', tz, n_points)
+        cx_af = ctx.get_constant('cx', cx, n_points)
+        cy_af = ctx.get_constant('cy', cy, n_points)
+        cz_af = ctx.get_constant('cz', cz, n_points)
+        nx_af = ctx.get_constant('nx', nx, n_points)
+        ny_af = ctx.get_constant('ny', ny, n_points)
+        nz_af = ctx.get_constant('nz', nz, n_points)
+        pos_norm_af = ctx.get_constant('pos_norm', pos_norm, n_points)
+        radius_af = ctx.get_constant('radius', radius, n_points)
+        n_dot_v_af = ctx.get_constant('n_dot_v', n_dot_v, n_points)
+        v_dot_t_af = ctx.get_constant('v_dot_t', v_dot_t, n_points)
+        h_af = ctx.get_constant('h_init', height, n_points)
     look_sign_af = ctx.get_constant('look_sign', look_side.sign, n_points)
     
     a_af = ctx.get_constant('a', ellipsoid.a, n_points)
@@ -127,9 +172,8 @@ def rdr2geo_arrayfire_optimized(
     e2_af = ctx.get_constant('e2', ellipsoid.e2, n_points)
     ep2_af = ctx.get_constant('ep2', ellipsoid.ep2, n_points)
     
-    h_af = ctx.get_constant('h_init', height, n_points)
-    
-    cos_theta = 0.5 * (pos_norm_af / slant_range_af + slant_range_af / pos_norm_af - (a_af / pos_norm_af) * (a_af / slant_range_af))
+    b_val = radius_af + h_af
+    cos_theta = 0.5 * (pos_norm_af / slant_range_af + slant_range_af / pos_norm_af - (b_val / pos_norm_af) * (b_val / slant_range_af))
     cos_theta = af.clamp(cos_theta, -1.0, 1.0)
     sin_theta = af.sqrt(1.0 - cos_theta * cos_theta)
     gamma = slant_range_af * cos_theta
@@ -174,65 +218,6 @@ def rdr2geo_arrayfire_optimized(
         x = sx_af + alpha * tx_af + beta * cx_af + gamma * nx_af
         y = sy_af + alpha * ty_af + beta * cy_af + gamma * ny_af
         z = sz_af + alpha * tz_af + beta * cz_af + gamma * nz_af
-    
-    for iteration in range(extra_iterations):
-        b_val = radius_af + h_af
-        cos_theta = 0.5 * (pos_norm_af / slant_range_af + slant_range_af / pos_norm_af - (b_val / pos_norm_af) * (b_val / slant_range_af))
-        cos_theta = af.clamp(cos_theta, -1.0, 1.0)
-        sin_theta = af.sqrt(1.0 - cos_theta * cos_theta)
-        gamma = slant_range_af * cos_theta
-        alpha = (dopfact_af - gamma * n_dot_v_af) / v_dot_t_af
-        across = slant_range_af * sin_theta
-        beta = af.sqrt(af.maxof(across * across - alpha * alpha, 0.0)) * look_sign_af
-        
-        x_new = sx_af + alpha * tx_af + beta * cx_af + gamma * nx_af
-        y_new = sy_af + alpha * ty_af + beta * cy_af + gamma * ny_af
-        z_new = sz_af + alpha * tz_af + beta * cz_af + gamma * nz_af
-        
-        p_new = af.sqrt(x_new * x_new + y_new * y_new)
-        lon_new = af.atan2(y_new, x_new)
-        theta = af.atan2(z_new * a_af, p_new * b_af)
-        sin_theta = af.sin(theta)
-        cos_theta = af.cos(theta)
-        lat_new = af.atan2(z_new + ep2_af * b_af * sin_theta * sin_theta * sin_theta, p_new - e2_af * a_af * cos_theta * cos_theta * cos_theta)
-        
-        sin_lat_new = af.sin(lat_new)
-        cos_lat_new = af.cos(lat_new)
-        sin_lon_new = af.sin(lon_new)
-        cos_lon_new = af.cos(lon_new)
-        prime_vertical_new = a_af / af.sqrt(1.0 - e2_af * sin_lat_new * sin_lat_new)
-        
-        x_ecef_new = (prime_vertical_new + dem_af) * cos_lat_new * cos_lon_new
-        y_ecef_new = (prime_vertical_new + dem_af) * cos_lat_new * sin_lon_new
-        z_ecef_new = (prime_vertical_new * (1.0 - e2_af) + dem_af) * sin_lat_new
-        
-        p_old = af.sqrt(x * x + y * y)
-        lon_old = af.atan2(y, x)
-        theta = af.atan2(z * a_af, p_old * b_af)
-        sin_theta = af.sin(theta)
-        cos_theta = af.cos(theta)
-        lat_old = af.atan2(z + ep2_af * b_af * sin_theta * sin_theta * sin_theta, p_old - e2_af * a_af * cos_theta * cos_theta * cos_theta)
-        
-        sin_lat_old = af.sin(lat_old)
-        cos_lat_old = af.cos(lat_old)
-        sin_lon_old = af.sin(lon_old)
-        cos_lon_old = af.cos(lon_old)
-        prime_vertical_old = a_af / af.sqrt(1.0 - e2_af * sin_lat_old * sin_lat_old)
-        
-        x_ecef_old = (prime_vertical_old + h_af) * cos_lat_old * cos_lon_old
-        y_ecef_old = (prime_vertical_old + h_af) * cos_lat_old * sin_lon_old
-        z_ecef_old = (prime_vertical_old * (1.0 - e2_af) + h_af) * sin_lat_old
-        
-        x_avg = 0.5 * (x_ecef_old + x_ecef_new)
-        y_avg = 0.5 * (y_ecef_old + y_ecef_new)
-        z_avg = 0.5 * (z_ecef_old + z_ecef_new)
-        
-        xyz_avg_norm = af.sqrt(x_avg * x_avg + y_avg * y_avg + z_avg * z_avg)
-        h_af = xyz_avg_norm - radius_af
-        
-        x = x_avg
-        y = y_avg
-        z = z_avg
     
     p = af.sqrt(x * x + y * y)
     lon = af.atan2(y, x)

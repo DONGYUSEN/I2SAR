@@ -67,7 +67,6 @@ i2sar/registration/offset_fit.py
 i2sar/registration/resampler.py
 i2sar/registration/resampler_numba.py
 i2sar/rtc/__init__.py
-i2sar/rtc/rtc.py
 i2sar/workflow/__init__.py
 i2sar/workflow/presets.py
 i2sar/workflow/runner.py

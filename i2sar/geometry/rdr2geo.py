@@ -1,4 +1,85 @@
+"""Radar-coordinate to geodetic-coordinate transforms.
+雷达坐标到地理坐标的转换模块。
+
+Primary API / 主要接口
+----------------------
+`rdr2geo(line, pixel, radar_grid, satellite_position, velocity, doppler, ...)`
+maps radar image coordinates to geodetic coordinates.
+`rdr2geo(...)` 将雷达影像坐标转换为大地坐标。
+
+Inputs / 输入
+-------------
+- `line`: azimuth image coordinate in pixel units. Scalars and 1-D arrays are
+  accepted; valid values are `[0, radar_grid.length)`.
+  方位向影像坐标，单位为像素；支持标量和一维数组；有效范围为
+  `[0, radar_grid.length)`。
+- `pixel`: range image coordinate in pixel units. Scalars and 1-D arrays are
+  accepted; valid values are `[0, radar_grid.width)`.
+  距离向影像坐标，单位为像素；支持标量和一维数组；有效范围为
+  `[0, radar_grid.width)`。
+- `radar_grid`: `RadarGrid` defining line-to-azimuth-time and
+  pixel-to-slant-range conversion.
+  雷达网格参数，用于将 `line` 转为方位时间、将 `pixel` 转为斜距。
+- `satellite_position`: either a static ECEF position vector `(3,)`, in meters,
+  or an `OrbitInterpolator`. When an orbit interpolator is supplied, each input
+  line is converted to azimuth time and the orbit is evaluated at that time.
+  卫星位置，可为静态 ECEF 三维位置向量 `(3,)`，单位米；也可为
+  `OrbitInterpolator`。当传入轨道插值器时，会按每个输入 `line` 对应的
+  方位时间插值得到卫星位置。
+- `velocity`: static ECEF velocity vector `(3,)`, in meters/second. Pass `None`
+  with `OrbitInterpolator` to use interpolated orbit velocity.
+  卫星速度，可为静态 ECEF 三维速度向量 `(3,)`，单位米/秒；若使用
+  `OrbitInterpolator`，可传入 `None` 以使用插值得到的速度。
+- `doppler`: Doppler centroid in Hz. The current public function accepts a
+  scalar; LUT behavior is handled on the inverse `geo2rdr` side.
+  多普勒中心频率，单位 Hz；当前公开接口使用标量值。多普勒 LUT 主要在
+  反变换 `geo2rdr` 中处理。
+- `dem` / `dem_elevation`: scalar height, per-point 1-D height array, image-grid
+  2-D height array indexed by `[floor(line), floor(pixel)]`, or
+  `DEMInterpolator`.
+  DEM 高程，可为标量、逐点一维数组、影像网格二维数组
+  `[floor(line), floor(pixel)]`，或 `DEMInterpolator`。
+- `ellipsoid`: geodetic ellipsoid, default WGS84.
+  大地椭球，默认 WGS84。
+- `wavelength_m`: radar wavelength in meters.
+  雷达波长，单位米。
+- `look_side`: `LookSide.RIGHT` or `LookSide.LEFT`. The sign convention follows
+  ISCE3 geocentric TCN: Right uses positive cross-track beta, Left negative.
+  观测侧，取 `LookSide.RIGHT` 或 `LookSide.LEFT`。符号约定与 ISCE3
+  地心 TCN 坐标一致：右视为正 cross-track beta，左视为负 beta。
+
+Outputs / 输出
+--------------
+- Scalar input returns `np.array([lat_deg, lon_deg, height_m])`.
+  标量输入返回 `np.array([纬度_deg, 经度_deg, 高程_m])`。
+- Vector input returns an array shaped `(3, n)` where rows are latitude in
+  degrees, longitude in degrees, and ellipsoid height in meters.
+  向量输入返回形状为 `(3, n)` 的数组，三行分别为纬度（度）、经度（度）、
+  椭球高（米）。
+- Inputs outside radar-grid bounds produce NaN in the corresponding output
+  column.
+  超出雷达网格范围的输入点，对应输出列为 NaN。
+
+Implementation notes / 实现说明
+-------------------------------
+- CPU, Numba, and ArrayFire accelerated paths are intended to be numerically
+  equivalent for scalar DEM / per-point DEM cases. Real ISCE3 data regression
+  tests enforce centimeter-level agreement for `rdr2geo`.
+  对标量 DEM 或逐点 DEM，高速路径（Numba/ArrayFire）应与 CPU 路径数值
+  等价；真实 ISCE3 数据回归测试采用厘米级一致性阈值。
+- The iterative solver follows ISCE3-style geocentric TCN geometry and updates
+  the target radius as `radius + h` during DEM-height convergence.
+  迭代解算遵循 ISCE3 风格的地心 TCN 几何，在 DEM 高程收敛过程中使用
+  `radius + h` 更新目标半径。
+- `compute_rdr2geo_mapping()` expands a full radar grid and returns three
+  2-D arrays `(lat_grid, lon_grid, height_grid)`.
+  `compute_rdr2geo_mapping()` 会展开整个雷达网格，返回三个二维数组：
+  `(lat_grid, lon_grid, height_grid)`。
+"""
+
+
 from __future__ import annotations
+
 
 from typing import Optional, Tuple, Union
 
@@ -25,13 +106,21 @@ def _validate_input_coordinates(line_arr: np.ndarray, pixel_arr: np.ndarray, rad
     return valid
 
 
-def _get_elevation_for_point(dem_elevation_arr: np.ndarray, idx: int, pixel: float, dem_ndim: int) -> float:
+def _get_elevation_for_point(
+    dem_elevation_arr: np.ndarray,
+    idx: int,
+    line: float,
+    pixel: float,
+    dem_ndim: int,
+) -> float:
     if dem_ndim == 0:
         return float(dem_elevation_arr)
     elif dem_ndim == 1:
         return float(dem_elevation_arr[idx])
     else:
-        return float(dem_elevation_arr[int(np.floor(pixel)), int(np.floor(pixel))])
+        row = int(np.floor(line))
+        col = int(np.floor(pixel))
+        return float(dem_elevation_arr[row, col])
 
 
 def _update_llh(
@@ -50,7 +139,12 @@ def _update_llh(
     
     pos_norm = np.linalg.norm(sat_pos)
     
-    cos_theta = 0.5 * (pos_norm / slant_range + slant_range / pos_norm - (radius / pos_norm) * (radius / slant_range))
+    target_radius = radius + h
+    cos_theta = 0.5 * (
+        pos_norm / slant_range
+        + slant_range / pos_norm
+        - (target_radius / pos_norm) * (target_radius / slant_range)
+    )
     cos_theta = np.clip(cos_theta, -1.0, 1.0)
     sin_theta = np.sqrt(1.0 - cos_theta * cos_theta)
     
@@ -236,11 +330,15 @@ def rdr2geo(
             if use_dem_interpolator:
                 h_new = dem.interpolate_at_lonlat(llh_new[0], llh_new[1])
             else:
-                h_new = _get_elevation_for_point(dem_elevation_arr, i, p_i, dem_ndim)
+                h_new = _get_elevation_for_point(dem_elevation_arr, i, l_i, p_i, dem_ndim)
             llh_new = (llh_new[0], llh_new[1], h_new)
 
             xyz_new = llh_to_ecef(llh_new[0], llh_new[1], llh_new[2], ellipsoid=ellipsoid)
-            h = np.linalg.norm(xyz_new) - radius
+            
+            if use_dem_interpolator:
+                h = np.linalg.norm(xyz_new) - radius
+            else:
+                h = h_new
 
             rng = np.linalg.norm(sat_pos_i - xyz_new)
             dr = abs(pixel_obj.range - rng)
@@ -252,7 +350,10 @@ def rdr2geo(
                 xyz_old = llh_to_ecef(llh_old[0], llh_old[1], llh_old[2], ellipsoid=ellipsoid)
                 xyz_avg = 0.5 * (xyz_old + xyz_new)
                 llh_new = ecef_to_llh(xyz_avg[0], xyz_avg[1], xyz_avg[2], ellipsoid=ellipsoid)
-                h = np.linalg.norm(xyz_avg) - radius
+                if use_dem_interpolator:
+                    h = np.linalg.norm(xyz_avg) - radius
+                else:
+                    h = llh_new[2]
 
             llh_old = llh_new
 
@@ -519,7 +620,7 @@ def rdr2geo_full(
             if use_dem_interpolator:
                 h_new = dem.interpolate_at_lonlat(llh_new[0], llh_new[1])
             else:
-                h_new = _get_elevation_for_point(dem_elevation_arr, i, p_i, dem_ndim)
+                h_new = _get_elevation_for_point(dem_elevation_arr, i, l_i, p_i, dem_ndim)
             llh_new = (llh_new[0], llh_new[1], h_new)
 
             xyz_new = llh_to_ecef(llh_new[0], llh_new[1], llh_new[2], ellipsoid=ellipsoid)

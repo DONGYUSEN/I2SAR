@@ -22,7 +22,7 @@ class TCNBasis:
             return TCNBasis(t=np.array([1.0, 0.0, 0.0]), c=np.array([0.0, 1.0, 0.0]), n=n)
         c = c / c_norm
 
-        t = np.cross(n, c)
+        t = np.cross(c, n)
         t = t / np.linalg.norm(t)
 
         return TCNBasis(t=t, c=c, n=n)

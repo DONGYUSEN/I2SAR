@@ -21,6 +21,16 @@ class TestTCNBasis:
         assert np.allclose(np.dot(basis.c, basis.n), 0.0, atol=1e-6)
         assert np.allclose(np.dot(basis.n, basis.t), 0.0, atol=1e-6)
 
+    def test_from_position_velocity_matches_isce3_geocentric_basis_orientation(self):
+        position = np.array([6371000.0, 0.0, 0.0])
+        velocity = np.array([0.0, 3000.0, 0.0])
+
+        basis = TCNBasis.from_position_velocity(position, velocity)
+
+        np.testing.assert_allclose(basis.n, np.array([-1.0, 0.0, 0.0]), atol=1e-12)
+        np.testing.assert_allclose(basis.c, np.array([0.0, 0.0, -1.0]), atol=1e-12)
+        np.testing.assert_allclose(basis.t, np.array([0.0, 1.0, 0.0]), atol=1e-12)
+
     def test_project(self):
         position = np.array([0.0, 0.0, 6371000.0])
         velocity = np.array([3000.0, 0.0, 0.0])

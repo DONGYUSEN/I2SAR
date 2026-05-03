@@ -85,14 +85,25 @@ class AcceleratedRdr2Geo:
             )
 
         elif method == "numba":
-            return self._numba_rdr2geo_with_chunking(line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem)
+            look_side = kwargs.get("look_side", LookSide.RIGHT)
+            wavelength_m = kwargs.get("wavelength_m", 0.0565642)
+            return self._numba_rdr2geo_with_chunking(
+                line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem, look_side, wavelength_m
+            )
 
         elif method == "arrayfire":
-            return self._arrayfire_rdr2geo_optimized(line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem)
+            look_side = kwargs.get("look_side", LookSide.RIGHT)
+            wavelength_m = kwargs.get("wavelength_m", 0.0565642)
+            return self._arrayfire_rdr2geo_optimized(
+                line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem, look_side, wavelength_m
+            )
 
         raise ValueError(f"unknown rdr2geo acceleration method: {method}")
 
-    def _arrayfire_rdr2geo_optimized(self, line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem):
+    def _arrayfire_rdr2geo_optimized(
+        self, line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem,
+        look_side=LookSide.RIGHT, wavelength_m=0.0565642,
+    ):
         n_points = len(line_arr)
         num_cols = radar_grid.width if hasattr(radar_grid, 'width') else int(np.sqrt(n_points))
         num_rows = n_points // num_cols
@@ -107,10 +118,11 @@ class AcceleratedRdr2Geo:
               f"GPU: {self._gpu_memory_mb} MB, chunk: {max_rows} rows")
 
         if isinstance(satellite_position, OrbitInterpolator):
-            mid_time = satellite_position.reference_epoch + satellite_position.number_of_seconds / 2.0
-            orbit_state = satellite_position.state_at(mid_time)
+            orbit_state = satellite_position.state_at(
+                radar_grid.line_to_azimuth_time(line_arr), allow_extrapolation=True
+            )
             sat_pos = orbit_state.position
-            sat_vel = orbit_state.velocity
+            sat_vel = orbit_state.velocity if velocity is None else velocity
         else:
             sat_pos = satellite_position
             sat_vel = velocity
@@ -127,7 +139,7 @@ class AcceleratedRdr2Geo:
         chunk_size = max_rows * num_cols
         if n_points <= chunk_size:
             try:
-                return rdr2geo_arrayfire_fast(
+                return rdr2geo_arrayfire(
                     line=line_arr,
                     pixel=pixel_arr,
                     radar_grid=radar_grid,
@@ -135,10 +147,14 @@ class AcceleratedRdr2Geo:
                     velocity=sat_vel,
                     doppler=doppler,
                     dem=dem_arr,
+                    look_side=look_side,
+                    wavelength_m=wavelength_m,
                 )
             except Exception as e:
                 print(f"[ArrayFire] rdr2geo failed: {e}, falling back to Numba")
-                return self._numba_rdr2geo_with_chunking(line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem)
+                return self._numba_rdr2geo_with_chunking(
+                    line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem, look_side, wavelength_m
+                )
 
         total_chunks = (n_points + chunk_size - 1) // chunk_size
         
@@ -153,7 +169,7 @@ class AcceleratedRdr2Geo:
             print(f"\r[GPU] rdr2geo: {chunk_idx + 1}/{total_chunks}", end="", flush=True)
             
             try:
-                chunk_result = rdr2geo_arrayfire_fast(
+                chunk_result = rdr2geo_arrayfire(
                     line=line_arr[idx_start:idx_end],
                     pixel=pixel_arr[idx_start:idx_end],
                     radar_grid=radar_grid,
@@ -161,6 +177,8 @@ class AcceleratedRdr2Geo:
                     velocity=sat_vel,
                     doppler=doppler,
                     dem=dem_arr[idx_start:idx_end],
+                    look_side=look_side,
+                    wavelength_m=wavelength_m,
                 )
             except Exception as e:
                 print(f"\n[ArrayFire] chunk {chunk_idx} failed: {e}, falling back to Numba")
@@ -171,7 +189,9 @@ class AcceleratedRdr2Geo:
                     satellite_position,
                     velocity,
                     doppler,
-                    dem
+                    dem,
+                    look_side,
+                    wavelength_m
                 )
             
             result_lat[idx_start:idx_end] = chunk_result[0]
@@ -182,7 +202,7 @@ class AcceleratedRdr2Geo:
         
         return np.stack([result_lat, result_lon, result_hgt], axis=0)
 
-    def _arrayfire_rdr2geo(self, line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem):
+    def _arrayfire_rdr2geo(self, line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem, look_side=LookSide.RIGHT):
         n_points = len(line_arr)
         num_cols = radar_grid.width if hasattr(radar_grid, 'width') else int(np.sqrt(n_points))
         num_rows = n_points // num_cols
@@ -198,7 +218,7 @@ class AcceleratedRdr2Geo:
 
         if num_rows <= max_rows:
             return self._arrayfire_rdr2geo_single_chunk(line_arr, pixel_arr, radar_grid, 
-                                                       satellite_position, velocity, doppler, dem)
+                                                       satellite_position, velocity, doppler, dem, look_side)
         
         total_chunks = (num_rows + max_rows - 1) // max_rows
         num_points_per_chunk = max_rows * num_cols
@@ -215,7 +235,7 @@ class AcceleratedRdr2Geo:
             
             chunk_result = self._arrayfire_rdr2geo_single_chunk(
                 line_arr[idx_start:idx_end], pixel_arr[idx_start:idx_end], radar_grid,
-                satellite_position, velocity, doppler, dem
+                satellite_position, velocity, doppler, dem, look_side
             )
             
             result_lat[idx_start:idx_end] = chunk_result[0]
@@ -226,7 +246,10 @@ class AcceleratedRdr2Geo:
         
         return np.stack([result_lat, result_lon, result_hgt], axis=0)
 
-    def _arrayfire_rdr2geo_single_chunk(self, line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem):
+    def _arrayfire_rdr2geo_single_chunk(
+        self, line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem,
+        look_side=LookSide.RIGHT, wavelength_m=0.0565642,
+    ):
         try:
             if isinstance(satellite_position, OrbitInterpolator):
                 mid_time = satellite_position.reference_epoch + satellite_position.number_of_seconds / 2.0
@@ -248,7 +271,9 @@ class AcceleratedRdr2Geo:
                     satellite_position=satellite_position,
                     velocity=None,
                     doppler=doppler,
-                    dem=0.0
+                    dem=0.0,
+                    look_side=look_side,
+                    wavelength_m=wavelength_m,
                 )
                 temp_lats, temp_lons = temp_result[0], temp_result[1]
                 dem_arr = np.array([float(dem.interpolate(np.rad2deg(temp_lats[i]), np.rad2deg(temp_lons[i]))) 
@@ -268,6 +293,8 @@ class AcceleratedRdr2Geo:
                 velocity=sat_vel,
                 doppler=doppler,
                 dem=dem_arr,
+                look_side=look_side,
+                wavelength_m=wavelength_m,
             )
 
             if len(line_arr) == 1:
@@ -276,9 +303,14 @@ class AcceleratedRdr2Geo:
             return result
         except Exception as e:
             print(f"[ArrayFire] rdr2geo GPU failed: {e}, falling back to Numba")
-            return self._numba_rdr2geo(line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem)
+            return self._numba_rdr2geo(
+                line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem, look_side, wavelength_m
+            )
 
-    def _numba_rdr2geo_with_chunking(self, line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem):
+    def _numba_rdr2geo_with_chunking(
+        self, line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem,
+        look_side=LookSide.RIGHT, wavelength_m=0.0565642,
+    ):
         n_points = len(line_arr)
         num_cols = radar_grid.width if hasattr(radar_grid, 'width') else int(np.sqrt(n_points))
         num_rows = n_points // num_cols
@@ -293,7 +325,9 @@ class AcceleratedRdr2Geo:
         print(f"[Numba] rdr2geo: {num_rows} rows × {num_cols} cols = {n_points:,} points, chunk: {max_rows} rows")
         
         if n_points <= chunk_size:
-            return self._numba_rdr2geo(line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem)
+            return self._numba_rdr2geo(
+                line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem, look_side, wavelength_m
+            )
         
         total_chunks = (n_points + chunk_size - 1) // chunk_size
         
@@ -314,7 +348,9 @@ class AcceleratedRdr2Geo:
                 satellite_position, 
                 velocity, 
                 doppler, 
-                dem
+                dem,
+                look_side,
+                wavelength_m
             )
             
             result_lat[idx_start:idx_end] = chunk_result[0]
@@ -325,24 +361,19 @@ class AcceleratedRdr2Geo:
         
         return np.stack([result_lat, result_lon, result_hgt], axis=0)
 
-    def _numba_rdr2geo(self, line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem):
+    def _numba_rdr2geo(
+        self, line_arr, pixel_arr, radar_grid, satellite_position, velocity, doppler, dem,
+        look_side=LookSide.RIGHT, wavelength_m=0.0565642,
+    ):
         a = 6378137.0
         b = 6356752.314245
 
-        orbit_start_time = 0.0
-        orbit_duration = 100.0
-
         if isinstance(satellite_position, OrbitInterpolator):
-            times = np.linspace(
-                satellite_position.reference_epoch,
-                satellite_position.reference_epoch + satellite_position.number_of_seconds,
-                1000
-            )
-            sat_positions = np.array([satellite_position.state_at(t).position for t in times], dtype=np.float64)
-            sat_velocities = np.array([satellite_position.state_at(t).velocity for t in times], dtype=np.float64)
-            orbit_start_time = float(satellite_position.reference_epoch)
-            orbit_duration = float(satellite_position.number_of_seconds)
+            sat_times = satellite_position.time.astype(np.float64)
+            sat_positions = satellite_position.position.astype(np.float64)
+            sat_velocities = satellite_position.velocity.astype(np.float64)
         else:
+            sat_times = np.array([0.0], dtype=np.float64)
             sat_positions = np.array([satellite_position], dtype=np.float64)
             sat_velocities = np.array([velocity], dtype=np.float64)
 
@@ -358,7 +389,9 @@ class AcceleratedRdr2Geo:
                 satellite_position=satellite_position,
                 velocity=None,
                 doppler=doppler,
-                dem=0.0
+                dem=0.0,
+                look_side=look_side,
+                wavelength_m=wavelength_m,
             )
             temp_lats, temp_lons = temp_result[0], temp_result[1]
             
@@ -384,19 +417,18 @@ class AcceleratedRdr2Geo:
             prf_hz=float(radar_grid.prf_hz),
             starting_range_m=float(radar_grid.starting_range_m),
             range_pixel_spacing_m=float(radar_grid.range_pixel_spacing_m),
+            sat_times=sat_times,
             sat_positions=sat_positions,
             sat_velocities=sat_velocities,
             doppler=float(doppler),
-            wavelength=0.0565642,
-            look_side_sign=-1.0,  # RIGHT look side (matches ISCE3 convention)
+            wavelength=float(wavelength_m),
+            look_side_sign=float(look_side.sign),
             dem_heights=dem_heights,
             a=a,
             b=b,
             max_iterations=25,
             extra_iterations=15,
             threshold=1e-8,
-            orbit_start_time=orbit_start_time,
-            orbit_duration=orbit_duration,
             length=length,
             width=width
         )
@@ -503,10 +535,32 @@ class AcceleratedGeo2Rdr:
             )
 
         elif method == "numba":
+            if isinstance(satellite_position, OrbitInterpolator):
+                return geo2rdr(
+                    lat=lat,
+                    lon=lon,
+                    height=height,
+                    radar_grid=radar_grid,
+                    satellite_position=satellite_position,
+                    velocity=velocity,
+                    doppler=doppler,
+                    **kwargs
+                )
             look_side = kwargs.get('look_side', LookSide.RIGHT)
             return self._numba_geo2rdr(lat_arr, lon_arr, h_arr, radar_grid, satellite_position, velocity, doppler, look_side)
 
         elif method == "arrayfire":
+            if isinstance(satellite_position, OrbitInterpolator):
+                return geo2rdr(
+                    lat=lat,
+                    lon=lon,
+                    height=height,
+                    radar_grid=radar_grid,
+                    satellite_position=satellite_position,
+                    velocity=velocity,
+                    doppler=doppler,
+                    **kwargs
+                )
             look_side = kwargs.get('look_side', LookSide.RIGHT)
             return self._arrayfire_geo2rdr(lat_arr, lon_arr, h_arr, radar_grid, satellite_position, velocity, doppler, look_side)
 
@@ -665,6 +719,7 @@ class AcceleratedGeo2Rdr:
             h_arr=h_arr.astype(np.float64),
             sat_positions=sat_positions,
             sat_velocities=sat_velocities,
+            sat_times=times.astype(np.float64),
             doppler=float(doppler),
             wavelength=0.0565642,
             a=a,
@@ -674,7 +729,7 @@ class AcceleratedGeo2Rdr:
             sensing_start_s=float(radar_grid.sensing_start_s),
             prf_hz=float(radar_grid.prf_hz),
             length=int(radar_grid.length),
-            look_side_right=True
+            look_side_right=(look_side == LookSide.RIGHT)
         )
 
         if len(lat_arr) == 1:

@@ -1,5 +1,6 @@
 import numpy as np
 
+from i2sar.core.enums import LookSide
 from i2sar.geometry import RadarGrid, WGS84
 from i2sar.geometry.accelerated_geometry import geo2rdr_fast, rdr2geo_fast
 from i2sar.geometry.geo2rdr import compute_geo2rdr_mapping, geo2rdr
@@ -64,7 +65,7 @@ def test_numba_geo2rdr_matches_numpy_for_static_orbit_vectors():
         sat_position,
         velocity,
         0.0,
-        use_bracket=False,
+        look_side=LookSide.LEFT,
     )
     actual = geo2rdr_fast(
         lats,
@@ -75,6 +76,7 @@ def test_numba_geo2rdr_matches_numpy_for_static_orbit_vectors():
         velocity,
         0.0,
         method="numba",
+        look_side=LookSide.LEFT,
     )
 
     np.testing.assert_allclose(actual, expected, atol=1e-6)
@@ -111,6 +113,7 @@ def test_compute_rdr2geo_mapping_uses_vectorized_rdr2geo(monkeypatch):
         velocity=velocity,
         doppler=0.0,
         dem_elevation=np.zeros((4, 3)),
+        method="original",
     )
 
     assert calls["count"] == 1
@@ -200,6 +203,7 @@ def test_compute_geo2rdr_mapping_supports_explicit_numba_method():
         velocity=velocity,
         doppler=0.0,
         method="original",
+        look_side=LookSide.LEFT,
     )
     actual = compute_geo2rdr_mapping(
         lats=lats,
@@ -209,6 +213,7 @@ def test_compute_geo2rdr_mapping_supports_explicit_numba_method():
         velocity=velocity,
         doppler=0.0,
         method="numba",
+        look_side=LookSide.LEFT,
     )
 
     for actual_arr, expected_arr in zip(actual, expected):

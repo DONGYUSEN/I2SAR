@@ -77,7 +77,7 @@ class TestRdr2GeoBasic:
             width=5,
             sensing_start_s=0.0,
             prf_hz=1000.0,
-            starting_range_m=400_000.0,
+            starting_range_m=600_000.0,
             range_pixel_spacing_m=10.0,
         )
 
@@ -236,7 +236,7 @@ class TestRdr2GeoWithDem:
             width=5,
             sensing_start_s=0.0,
             prf_hz=1000.0,
-            starting_range_m=400_000.0,
+            starting_range_m=600_000.0,
             range_pixel_spacing_m=20.0,
         )
 
