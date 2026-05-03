@@ -144,13 +144,76 @@ class OrbitData:
         
         return positions.reshape(original_shape + (3,)), velocities.reshape(original_shape + (3,))
     
-    def interpolate(self, t: np.ndarray, method: str = "hermite") -> tuple:
+    def interpolate_lagrange(self, t: np.ndarray, order: int = 5) -> tuple:
+        """
+        Lagrange 多项式插值
+        
+        Args:
+            t: 要插值的时间点 (...,)
+            order: 插值阶数，默认5阶
+        
+        Returns:
+            positions: 插值后的位置 (..., 3)
+            velocities: 插值后的速度 (..., 3)
+        """
+        original_shape = t.shape
+        t_flat = np.asarray(t, dtype=np.float64).ravel()
+        n_points = len(t_flat)
+        
+        positions = np.zeros((n_points, 3), dtype=np.float64)
+        velocities = np.zeros((n_points, 3), dtype=np.float64)
+        
+        half_order = order // 2
+        
+        for i, t_val in enumerate(t_flat):
+            idx = np.searchsorted(self.times, t_val)
+            idx = max(half_order, min(idx, len(self.times) - half_order - 1))
+            
+            start_idx = idx - half_order
+            end_idx = idx + half_order + 1
+            start_idx = max(0, start_idx)
+            end_idx = min(len(self.times), end_idx)
+            
+            local_times = self.times[start_idx:end_idx]
+            local_positions = self.positions[start_idx:end_idx]
+            local_velocities = self.velocities[start_idx:end_idx]
+            
+            n_local = len(local_times)
+            
+            pos = np.zeros(3)
+            vel = np.zeros(3)
+            
+            for j in range(n_local):
+                L = 1.0
+                dL = 0.0
+                
+                for k in range(n_local):
+                    if k != j:
+                        denom = local_times[j] - local_times[k]
+                        L *= (t_val - local_times[k]) / denom
+                        
+                        dL_term = 1.0 / denom
+                        for m in range(n_local):
+                            if m != j and m != k:
+                                dL_term *= (t_val - local_times[m]) / (local_times[j] - local_times[m])
+                        dL += dL_term
+                
+                pos += L * local_positions[j]
+                vel += L * local_velocities[j] + dL * local_positions[j]
+            
+            positions[i] = pos
+            velocities[i] = vel
+        
+        return positions.reshape(original_shape + (3,)), velocities.reshape(original_shape + (3,))
+    
+    def interpolate(self, t: np.ndarray, method: str = "hermite", **kwargs) -> tuple:
         """
         统一的插值接口
         
         Args:
             t: 要插值的时间点
-            method: 插值方法 ('linear', 'hermite')
+            method: 插值方法 ('linear', 'hermite', 'lagrange')
+            **kwargs: 额外参数（如 lagrange 的 order）
         
         Returns:
             positions: 插值后的位置
@@ -161,6 +224,9 @@ class OrbitData:
             return self.interpolate_linear(t)
         elif method == "hermite":
             return self.interpolate_hermite(t)
+        elif method == "lagrange":
+            order = kwargs.get("order", 5)
+            return self.interpolate_lagrange(t, order=order)
         else:
             raise ValueError(f"Unknown interpolation method: {method}")
     

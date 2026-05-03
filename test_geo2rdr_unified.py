@@ -133,9 +133,17 @@ def test_interpolation_methods():
         method="python", interp_method="hermite"
     )
     
-    print(f"线性插值:  aztime={aztime_lin:.10f}, range={range_lin:.6f}")
+    aztime_lagrange, range_lagrange = geo2rdr_unified(
+        lat, lon, height, radar_grid, orbit,
+        doppler=125.0, look_side=LookSide.RIGHT,
+        method="python", interp_method="lagrange"
+    )
+    
+    print(f"线性插值:    aztime={aztime_lin:.10f}, range={range_lin:.6f}")
     print(f"Hermite插值: aztime={aztime_herm:.10f}, range={range_herm:.6f}")
-    print(f"差异:     aztime_diff={abs(aztime_lin - aztime_herm):.10f}, range_diff={abs(range_lin - range_herm):.6f}")
+    print(f"Lagrange插值: aztime={aztime_lagrange:.10f}, range={range_lagrange:.6f}")
+    print(f"\n线性 vs Hermite: aztime_diff={abs(aztime_lin - aztime_herm):.10f}, range_diff={abs(range_lin - range_herm):.6f}")
+    print(f"Hermite vs Lagrange: aztime_diff={abs(aztime_herm - aztime_lagrange):.10f}, range_diff={abs(range_herm - range_lagrange):.6f}")
     
     print("插值方法测试通过！")
 
