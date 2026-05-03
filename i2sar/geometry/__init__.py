@@ -8,6 +8,7 @@ from i2sar.geometry.radar_grid import SPEED_OF_LIGHT, RadarGrid, read_radar_grid
 from i2sar.geometry.rdr2geo import Rdr2GeoParams, Rdr2GeoResult, compute_rdr2geo_mapping, rdr2geo, rdr2geo_full
 from i2sar.geometry.tcn_basis import TCNBasis
 from i2sar.geometry.geo2rdr import compute_geo2rdr_mapping, geo2rdr
+from i2sar.geometry.geo2rdr_unified import geo2rdr_unified
 
 __all__ = [
     "Doppler",
@@ -26,6 +27,7 @@ __all__ = [
     "compute_rdr2geo_mapping",
     "ecef_to_llh",
     "geo2rdr",
+    "geo2rdr_unified",
     "llh_to_ecef",
     "rdr2geo",
     "rdr2geo_full",

@@ -98,103 +98,63 @@ def _find_closest_aztime_batch(target_ecef: np.ndarray, sat_positions: np.ndarra
     
     for i in range(n_points):
         target = target_ecef[i]
-        r_closest = 1e16
-        idx_closest = 0
-        valid_found = False
-        
-        for k in range(n_sat):
-            pos = sat_positions[k]
-            vel = sat_velocities[k]
-            rvec = target - pos
-            r = np.linalg.norm(rvec)
-            
-            cross_prod = np.cross(rvec, vel)
-            dot_prod = np.dot(cross_prod, pos)
-            is_valid = (dot_prod > 0) == look_side_right
-            
-            if is_valid:
-                valid_found = True
-                if r < r_closest:
-                    r_closest = r
-                    idx_closest = k
-        
-        if valid_found:
-            closest_times[i] = sat_times[idx_closest]
+        min_dist = np.inf
+        best_time = closest_times[i]
+        for j in range(n_sat):
+            dist = np.linalg.norm(target - sat_positions[j])
+            if dist < min_dist:
+                rvec = target - sat_positions[j]
+                cross_prod = np.cross(rvec, sat_velocities[j])
+                dot_prod = np.dot(cross_prod, sat_positions[j])
+                is_right = dot_prod > 0
+                if is_right == look_side_right:
+                    min_dist = dist
+                    best_time = sat_times[j]
+        closest_times[i] = best_time
     
     return closest_times
 
 
 def _geo2rdr_single_batch(lat_arr: np.ndarray, lon_arr: np.ndarray, h_arr: np.ndarray,
                           orbit_data: OrbitData, radar_grid: RadarGrid,
-                          doppler: float, wavelength: float, look_side: LookSide,
-                          max_iterations: int = 50, threshold: float = 1e-8,
-                          interp_method: str = "hermite") -> Tuple[np.ndarray, np.ndarray]:
+                          doppler: float, wavelength_m: float, look_side: LookSide,
+                          max_iterations: int, threshold: float, interp_method: str):
     """
-    批量 geo2rdr 计算（纯 Python 实现，用于参考）
-    
-    Args:
-        lat_arr: 纬度数组 (N,)
-        lon_arr: 经度数组 (N,)
-        h_arr: 高度数组 (N,)
-        orbit_data: 轨道数据对象
-        radar_grid: 雷达网格参数
-        doppler: 多普勒中心频率 (Hz)
-        wavelength: 波长 (m)
-        look_side: 观察侧
-        max_iterations: 最大迭代次数
-        threshold: 收敛阈值
-        interp_method: 插值方法 ('linear', 'hermite')
-    
-    Returns:
-        aztimes: 方位时间数组 (N,)
-        slant_ranges: 斜距数组 (N,)
+    Python 批量实现
     """
     n_points = len(lat_arr)
     
     target_ecef = llh_to_ecef(lat_arr, lon_arr, h_arr)
     
     look_side_right = (look_side == LookSide.RIGHT)
-    t_az = _find_closest_aztime_batch(
-        target_ecef, orbit_data.positions, orbit_data.velocities, 
-        orbit_data.times, look_side_right
-    )
-    
-    aztimes = np.full(n_points, np.nan)
-    slant_ranges = np.full(n_points, np.nan)
-    valid_mask = np.ones(n_points, dtype=bool)
+    t_az = _find_closest_aztime_batch(target_ecef, orbit_data.positions, 
+                                       orbit_data.velocities, orbit_data.times,
+                                       look_side_right)
     
     for iteration in range(max_iterations):
         fn, fnprime, slant_range, sat_pos, sat_vel = _compute_doppler_residual(
-            t_az[valid_mask], target_ecef[valid_mask], orbit_data, 
-            doppler, wavelength, interp_method
+            t_az, target_ecef, orbit_data, doppler, wavelength_m, interp_method
         )
         
-        dt = np.where(fnprime != 0, fn / fnprime, 0.0)
+        dt = np.where(np.abs(fnprime) > 1e-12, fn / fnprime, 0.0)
         
-        t_az[valid_mask] -= dt
+        rvec = target_ecef - sat_pos
+        for i in range(n_points):
+            if not _check_look_side(rvec[i], sat_vel[i], sat_pos[i], look_side_right):
+                dt[i] = 0.0
+        
+        t_az = t_az - dt
         
         t_az = np.clip(t_az, orbit_data.t_min, orbit_data.t_max)
         
-        converged = np.abs(dt) < threshold
-        newly_converged = valid_mask & converged
-        
-        if np.any(newly_converged):
-            aztimes[newly_converged] = t_az[newly_converged]
-            slant_ranges[newly_converged] = slant_range[converged[newly_converged.nonzero()[0]]]
-            valid_mask[newly_converged] = False
-        
-        if not np.any(valid_mask):
+        if np.max(np.abs(dt)) < threshold:
             break
     
-    if np.any(valid_mask):
-        fn, fnprime, slant_range, sat_pos, sat_vel = _compute_doppler_residual(
-            t_az[valid_mask], target_ecef[valid_mask], orbit_data, 
-            doppler, wavelength, interp_method
-        )
-        aztimes[valid_mask] = t_az[valid_mask]
-        slant_ranges[valid_mask] = slant_range
+    _, _, final_range, _, _ = _compute_doppler_residual(
+        t_az, target_ecef, orbit_data, doppler, wavelength_m, interp_method
+    )
     
-    return aztimes, slant_ranges
+    return t_az, final_range
 
 
 def geo2rdr_unified(lat: Union[float, np.ndarray], 
@@ -225,8 +185,8 @@ def geo2rdr_unified(lat: Union[float, np.ndarray],
         look_side: 观察侧 (LEFT/RIGHT)
         max_iterations: 最大迭代次数
         threshold: 收敛阈值 (秒)
-        interp_method: 轨道插值方法 ('linear', 'hermite')
-        method: 计算后端 ('python', 'numba')
+        interp_method: 轨道插值方法 ('linear', 'hermite', 'lagrange')
+        method: 计算后端 ('python', 'numba', 'gpu')
     
     Returns:
         aztimes: 方位时间数组
@@ -249,22 +209,30 @@ def geo2rdr_unified(lat: Union[float, np.ndarray],
     if len(lat_arr) != len(lon_arr) or len(lat_arr) != len(h_arr):
         raise ValueError("lat, lon, height must have the same length")
     
-    if isinstance(satellite_position, OrbitInterpolator):
-        orbit_data = OrbitData.from_orbit_interpolator(satellite_position)
-    else:
-        if velocity is None:
-            raise ValueError("velocity must be provided for static orbit")
-        orbit_data = OrbitData.from_static_orbit(satellite_position, velocity)
-    
     look_side_right = (look_side == LookSide.RIGHT)
     
     if method.lower() == "python":
+        if isinstance(satellite_position, OrbitInterpolator):
+            orbit_data = OrbitData.from_orbit_interpolator(satellite_position)
+        else:
+            if velocity is None:
+                raise ValueError("velocity must be provided for static orbit")
+            orbit_data = OrbitData.from_static_orbit(satellite_position, velocity)
+        
         aztimes, slant_ranges = _geo2rdr_single_batch(
             lat_arr, lon_arr, h_arr, orbit_data, radar_grid,
             doppler, wavelength_m, look_side,
             max_iterations, threshold, interp_method
         )
+    
     elif method.lower() == "numba":
+        if isinstance(satellite_position, OrbitInterpolator):
+            orbit_data = OrbitData.from_orbit_interpolator(satellite_position)
+        else:
+            if velocity is None:
+                raise ValueError("velocity must be provided for static orbit")
+            orbit_data = OrbitData.from_static_orbit(satellite_position, velocity)
+        
         try:
             from .geo2rdr_numba import geo2rdr_numba_parallel
             aztimes, slant_ranges = geo2rdr_numba_parallel(
@@ -286,11 +254,36 @@ def geo2rdr_unified(lat: Union[float, np.ndarray],
                 look_side_right=look_side_right
             )
         except ImportError:
+            orbit_data = OrbitData.from_orbit_interpolator(satellite_position)
             aztimes, slant_ranges = _geo2rdr_single_batch(
                 lat_arr, lon_arr, h_arr, orbit_data, radar_grid,
                 doppler, wavelength_m, look_side,
                 max_iterations, threshold, interp_method
             )
+    
+    elif method.lower() == "gpu":
+        if not isinstance(satellite_position, OrbitInterpolator):
+            raise ValueError("GPU mode requires OrbitInterpolator")
+        
+        try:
+            from .geo2rdr_gpu_isce3_style import geo2rdr_gpu_isce3_style
+            aztimes, slant_ranges = geo2rdr_gpu_isce3_style(
+                lat=lat_arr,
+                lon=lon_arr,
+                height=h_arr,
+                radar_grid=radar_grid,
+                satellite_position=satellite_position,
+                doppler=doppler,
+                wavelength_m=wavelength_m,
+                max_iterations=max_iterations,
+                threshold=threshold,
+                look_side=look_side
+            )
+        except ImportError:
+            raise RuntimeError("GPU module not available")
+        except Exception as e:
+            raise RuntimeError(f"GPU execution failed: {e}")
+    
     else:
         raise ValueError(f"Unknown method: {method}")
     
