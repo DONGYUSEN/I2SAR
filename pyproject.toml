@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "i2sar"
+version = "0.1.0"
+description = "HDF5-centered SAR/InSAR processing foundation"
+requires-python = ">=3.10"
+dependencies = [
+  "arrayfire>=3.8.0",
+  "h5py",
+  "numba>=0.65.1",
+  "numpy",
+  "scipy>=1.15.3",
+  "tifffile",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+i2sar = "i2sar.cli.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

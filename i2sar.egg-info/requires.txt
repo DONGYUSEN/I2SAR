@@ -1,0 +1,9 @@
+arrayfire>=3.8.0
+h5py
+numba>=0.65.1
+numpy
+scipy>=1.15.3
+tifffile
+
+[test]
+pytest

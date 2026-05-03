@@ -1,0 +1,126 @@
+# I2SAR 进度记录
+
+## 2026-04-28
+
+- 启动 I2SAR 重写规划。
+- 查看 I2SAR 当前目录，发现基本为空且不是 git 仓库。
+- 查看 D2SAR 文件结构和关键脚本，确认其主要可迁移内容是数据导入、数据组织、预处理和诊断经验。
+- 查看 C2SAR2 说明文档、工作流和 `dinsar.py`，确认其主要可迁移内容是全流程编排、配准、干涉、snaphu 解缠、地理编码和 LOS 输出。
+- 创建 `task_plan.md`、`findings.md`、`progress.md` 作为长期规划记录。
+- 确认第一阶段 MVP 优先级：统一数据模型和空流程先行，不先绑定 LuTan-1、天仪或 Sentinel-1。
+- 确认内部主数据组织方式：HDF5 管理所有数据，其他格式作为导入源或最终导出格式。
+- 确认 HDF5 组织粒度：项目级索引文件 + scene/pair/product 独立 HDF5 文件。
+- 确认几何模块策略：`rdr2geo` / `geo2rdr` 使用纯 Python/Numpy 实现，ISCE3 不作为运行依赖。
+- 确认接口策略：Python API 为核心，CLI、配置工作流和未来 Web API 作为薄封装。
+- 用户同意进入第一版总体设计，下一步开始分段确认架构、HDF5 schema、数据流、工作流和测试策略。
+- 第一部分总体架构边界已进入确认后的展开阶段，开始设计 HDF5 schema。
+- 第二部分 HDF5 schema 方向按用户“继续”视为通过，开始展开全流程数据流和模块职责。
+- 第三部分数据流和模块职责已由用户确认，开始展开工作流、缓存和断点续跑设计。
+- 第四部分工作流、缓存和断点续跑已由用户确认。
+- 用户新增两项范围：数据导入要支持更多 Stripmap/TOPS 模式；RTC 要作为独立处理链纳入 I2SAR，而不是干涉处理的附属步骤。
+- 已查看 D2SAR 的 `strip_rtc.py`、`strip_insar.py`、`strip_insar2.py`，确认 RTC 与 Stripmap InSAR 有现成迁移经验，但需剥离 ISCE3/GPU 运行时耦合。
+- 已写入正式设计文档 `docs/superpowers/specs/2026-04-28-i2sar-design.md`。
+- 已完成设计文档自检：未发现 TBD/TODO、明显范围矛盾或遗漏；同步修正 `task_plan.md` 标题。
+- 用户确认设计文档后，进入第一阶段实施计划编写。
+- 已写入实施计划 `docs/superpowers/plans/2026-04-28-i2sar-phase1-foundation.md`，覆盖包骨架、数据模型、HDF5、Project 索引、workflow、CLI 和测试。
+- 已完成实施计划占位符扫描，未发现 TBD/TODO 等红旗模式。
+- 完成第一阶段基础骨架实现：Python 包、HDF5 schema、Project/Scene/Pair/Product、空 workflow、CLI 和测试。
+- 验证命令：`uv run --extra test pytest -v` 通过。
+- 当前目录不是 git 仓库，跳过提交。
+- 最终审查后补充产品 owner 校验，防止 product 指向不存在的 scene/pair/project。
+- 同步 `task_plan.md`：阶段 0 和阶段 1 标记为 complete，当前阶段转入阶段 2 准备。
+- 开始第二阶段：迁移 D2SAR 数据导入与数据组织能力；用户强调需要参考已有 LuTan 轨道平滑和 Sentinel 数据导入处理经验。
+- 已阅读 D2SAR 的 `lutan_importer.py`、`tianyi_importer.py`、`orbit_smooth.py`、`common_processing.py` 相关片段，以及 `test_lutan_importer_orbit_smooth.py`、`test_tianyi_importer_slc_format.py`。
+- 第二阶段设计约束更新：LuTan 导入必须保留 raw/smoothed orbit 与 smoothing provenance；天仪/Sentinel SAFE-like 导入必须保留单波段复数 TIFF 格式语义和 ancillary/source reference。
+- 第二阶段实施开始：先运行基线测试 `uv run --extra test pytest -v`，当前 29 个测试通过。
+- TDD RED：新增 `tests/test_io_source.py` 后运行 `uv run --extra test pytest tests/test_io_source.py -v`，按预期因 `i2sar.io` 模块缺失失败。
+- 实现 `i2sar/io/base.py`、`i2sar/io/source.py`、`i2sar/io/__init__.py`，覆盖 `SourceRef`、VSI 路径、目录/ZIP/TAR 成员发现。
+- `uv run --extra test pytest tests/test_io_source.py -v` 通过，3 个测试通过。
+- TDD RED：新增 `tests/test_orbit_smooth.py` 后运行 `uv run --extra test pytest tests/test_orbit_smooth.py -v`，按预期因 `i2sar.orbit` 模块缺失失败。
+- 实现 `i2sar/orbit/smooth.py` 和 `i2sar/orbit/__init__.py`，迁移 LuTan 轨道平滑入口、少于 8 个 state vector 跳过逻辑和 smoothing provenance。
+- `uv run --extra test pytest tests/test_orbit_smooth.py -v` 通过，2 个测试通过。
+- TDD RED：新增 `tests/test_scene_writer.py` 后运行 `uv run --extra test pytest tests/test_scene_writer.py -v`，按预期因 `i2sar.io.scene_writer` 缺失失败。
+- 扩展 scene HDF5 skeleton/schema，新增 `/orbit_raw`；实现 `i2sar/io/scene_writer.py`，统一写入 metadata、radar_grid、doppler、orbit、orbit_raw 和 SLC attrs。
+- `uv run --extra test pytest tests/test_hdf_entities.py tests/test_scene_writer.py -v` 通过，6 个测试通过。
+- TDD RED：新增 `tests/test_lutan_import.py` 后运行 `uv run --extra test pytest tests/test_lutan_import.py -v`，按预期因 `i2sar.io.lutan` 缺失失败。
+- 实现 `i2sar/io/lutan.py`，覆盖 LuTan 文件发现、`_parsed_from_parts()`、orbit smoothing 集成、raw orbit 保留和 `iq_int16`/`two_band_iq` SLC attrs。
+- `uv run --extra test pytest tests/test_lutan_import.py -v` 通过，1 个测试通过。
+- TDD RED：新增 `tests/test_safe_like_import.py` 后运行 `uv run --extra test pytest tests/test_safe_like_import.py -v`，按预期因 `i2sar.io.safe_like` 缺失失败。
+- 实现 `i2sar/io/safe_like.py`，覆盖 annotation/calibration/manifest/measurement 发现、天仪/Sentinel 单波段复数 SLC attrs，并支持 TOPS schema 场景写入。
+- `uv run --extra test pytest tests/test_safe_like_import.py -v` 通过，2 个测试通过。
+- TDD RED：新增 `tests/test_import_scene_api.py` 后运行 `uv run --extra test pytest tests/test_import_scene_api.py -v`，按预期因 `import_scene` 未导出失败。
+- 在 `i2sar/io/__init__.py` 中实现统一 `import_scene()` 分派入口，显式 sensor 支持 `lutan`、`tianyi`、`sentinel1`，未知 auto 源保守报错。
+- 补充 `import_scene()` 默认模式测试：`tianyi` 默认 `stripmap`、`sentinel1` 默认 `tops`；先观察到 `tianyi + auto` 枚举转换失败，再修正默认分派逻辑。
+- 第二阶段新增导入测试集验证：`uv run --extra test pytest tests/test_io_source.py tests/test_orbit_smooth.py tests/test_scene_writer.py tests/test_lutan_import.py tests/test_safe_like_import.py tests/test_import_scene_api.py -v` 通过，11 个测试通过。
+- 全量验证命令：`uv run --extra test pytest -v` 通过，40 个测试通过。
+- 当前第二阶段结果是导入基础骨架与关键契约迁移；完整 LuTan/SAFE-like XML 字段解析仍需作为阶段 2 下一小步继续实施。
+- TDD RED：新增 LuTan/SAFE-like 最小真实 XML 解析测试后运行 `uv run --extra test pytest tests/test_lutan_import.py tests/test_safe_like_import.py -v`，按预期因 `parse()` 仍抛出 `NotImplementedError` 失败。
+- 新增 `i2sar/io/xml.py`，实现目录/ZIP/TAR XML 读取、GPS 秒转换和 XML 基础类型转换 helper。
+- 实现 LuTan 与 SAFE-like 第一版 `parse()` 字段抽取，覆盖 acquisition、scene、orbit、radar_grid、doppler，并直接写入标准 `scene.h5`。
+- 补充 SAFE-like ZIP importer 测试，验证 HDF5 SLC attrs 保留 `storage=zip`、`member` 和 zip 绝对路径引用。
+- 补充 LuTan ZIP importer 测试，验证压缩包内 `.meta.xml` 与 `SLC.tiff` 可直接导入，并保留 zip/member 引用；少于 8 个 state vector 时 orbit smoothing 按预期跳过。
+- 第二阶段导入测试集验证：`uv run --extra test pytest tests/test_io_source.py tests/test_orbit_smooth.py tests/test_scene_writer.py tests/test_lutan_import.py tests/test_safe_like_import.py tests/test_import_scene_api.py -v` 通过，16 个测试通过。
+- 全量验证命令：`uv run --extra test pytest -v` 通过，45 个测试通过。
+- 同步 `task_plan.md`：阶段 2 标记为 complete，当前阶段转入阶段 3 几何模块准备。
+- 用户补充阶段 2 导入要求：SLC 文件本身也必须导入 HDF5，统一转换为单波段复数据，同时 real/imag 的原始 dtype 不改变；本阶段保持数据大小。
+- 设计确认：`/slc/data` 使用二维 HDF5 dataset，dtype 为 compound `real`/`imag`，字段 dtype 保持源数据整数或浮点类型。
+- TDD RED：新增 `tests/test_slc_import.py` 后运行 `uv run --extra test pytest tests/test_slc_import.py -v`，按预期因 `/slc/data` 未写入失败。
+- 新增 `tifffile` 依赖和 `i2sar/io/slc.py`，实现 TIFF SLC 读取并转换为 compound `real`/`imag` 单波段复数据；`scene_writer` 写入 `/slc/data`。
+- 调整既有 importer/scene_writer 测试使用真实小型 TIFF；修正 ZIP/TAR 内 TIFF 读取为带 `.tiff` 后缀的临时文件，满足 `tifffile` 对文件名的要求。
+- 相关验证命令：`uv run --extra test pytest tests/test_slc_import.py tests/test_lutan_import.py tests/test_safe_like_import.py tests/test_scene_writer.py -v` 通过，11 个测试通过。
+- 全量验证命令：`uv run --extra test pytest -v` 通过，47 个测试通过。
+- 开始阶段 3 几何模块准备：读取 `task_plan.md`、`findings.md`、`progress.md`，并搜索 D2SAR/C2SAR2 中 `rdr2geo`、`geo2rdr`、`geosar`、`ll2sar`、`sar2ll`、DEM 和 orbit 相关实现。
+- 已阅读 C2SAR2 `utils/geosar.py`、`utils/ll2sar.py`、`utils/sar2ll.py` 的关键开头和映射表接口；确认旧代码多依赖 HDF 映射表/GDAL/ISCE3，I2SAR 阶段 3 需要先建立纯 Python/Numpy 几何基础件。
+- 用户要求在几何模块之前迁移改造 D2SAR DEM 模块，并生成 DEM HDF5；明确 scene corners -> bbox 默认相对角点外扩 0.2 度。
+- TDD RED：新增 `tests/test_dem.py` 后运行 `uv run --extra test pytest tests/test_dem.py -v`，按预期因 `i2sar.dem` 模块缺失失败。
+- 新增 `i2sar/dem` 模块，覆盖 corners 默认外扩 0.2 度、bbox -> SRTM tile、HGT 读取和 DEM HDF5 写入；新增 `ProductType.DEM` 和产品 schema 支持。
+- 补充从 scene.h5 `derived.sceneCorners` 生成 DEM product 的入口，默认 margin 为 0.2 度，并记录 source scene_id 与 tile 列表。
+- DEM 测试命令：`uv run --extra test pytest tests/test_dem.py -v` 通过，5 个测试通过。
+- 全量验证命令：`uv run --extra test pytest -v` 通过，52 个测试通过。
+- 继续阶段 3 几何基础件：TDD RED 运行 `uv run --extra test pytest tests/test_geometry_ellipsoid.py -v`，按预期因 `i2sar.geometry` 模块缺失失败。
+- 新增 `i2sar/geometry` 包，实现 WGS84 椭球常量、`llh_to_ecef()` 和 `ecef_to_llh()`，支持 scalar 与 numpy array 输入。
+- 椭球测试命令：`uv run --extra test pytest tests/test_geometry_ellipsoid.py -v` 通过，3 个测试通过。
+- 全量验证命令：`uv run --extra test pytest -v` 通过，55 个测试通过。
+- 继续阶段 3 轨道基础件：TDD RED 新增 `tests/test_orbit_interpolate.py` 后运行 `uv run --extra test pytest tests/test_orbit_interpolate.py -v`，按预期因 `OrbitInterpolator` 未导出失败。
+- 新增 `i2sar/orbit/interpolate.py`，实现 `OrbitInterpolator`、`OrbitState` 和 `read_orbit_interpolator()`；当前第一版使用线性位置/速度插值，支持时间排序、向量化查询和默认越界保护。
+- 轨道插值测试命令：`uv run --extra test pytest tests/test_orbit_interpolate.py -v` 通过，4 个测试通过。
+- 全量验证命令：`uv run --extra test pytest -v` 通过，59 个测试通过。
+- 继续阶段 3 几何核心件：TDD RED 新增 `tests/test_geometry_rdr2geo.py` 后运行 `uv run --extra test pytest tests/test_geometry_rdr2geo.py -v`，按预期因 `i2sar.geometry.rdr2geo` 模块缺失失败。
+- 新增 `i2sar/geometry/rdr2geo.py`，实现 `rdr2geo()` 和 `compute_rdr2geo_mapping()`，支持标量/向量输入、零多普勒收敛和 DEM 高程输入。
+- `rdr2geo` 测试通过：6 个测试通过。
+- 新增 `tests/test_geometry_geo2rdr.py`，TDD RED 后实现 `i2sar/geometry/geo2rdr.py`，实现 `geo2rdr()` 和 `compute_geo2rdr_mapping()`，支持 `OrbitInterpolator` 集成。
+- `geo2rdr` 测试通过：5 个测试通过。
+- 新增 `tests/test_geometry_doppler.py`，TDD RED 后实现 `i2sar/geometry/doppler.py`，实现 `Doppler` 类（常数/多项式模型）、HDF5 读写支持。
+- `Doppler` 测试通过：7 个测试通过。
+- 新增 `tests/test_dem_sampling.py`，TDD RED 后实现 `i2sar/dem/sampling.py`，实现 DEM 读取、双线性插值采样和边界保护。
+- `DEM sampling` 测试通过：5 个测试通过。
+- 全量验证命令：`uv run --extra test pytest -v` 通过，86 个测试通过。
+- 阶段 3 几何模块核心件完成：`rdr2geo`、`geo2rdr`、`Doppler`、`DEM sampling`、`RadarGrid`、`OrbitInterpolator` 均已实现并测试通过。
+- 2026-04-29 性能推进：分析当前进展，确认阶段 0-5b 已完成，阶段 6 未开始；热点集中在几何映射、配准 FFT/重采样、干涉滤波与 RTC 栅格计算。
+- 本机环境：Debian 13，NVIDIA GTX 1060 6GB，驱动 550.163.01，CUDA driver capability 12.4。
+- 安装 ArrayFire：Python wrapper `arrayfire==3.8.0` 加入项目依赖；底层 ArrayFire 3.8.3 CUDA 12.0 安装在 `/home/ysdong/Software/arrayfire`。
+- 新增 `env-arrayfire.sh`，设置 `AF_PATH=/home/ysdong/Software/arrayfire` 和 `LD_LIBRARY_PATH=$AF_PATH/lib64`。
+- 补齐实际运行依赖 `scipy` 与 `numba`，此前代码已 import 但 `pyproject.toml` 未声明。
+- 新增 `i2sar.accel.arrayfire_backend`，集中处理 ArrayFire 探测、可用性原因和 ndarray 转换。
+- 新增 ArrayFire 可选重采样后端：`Resampler(..., backend="arrayfire")` 可走 GPU 双线性插值，`backend="auto"` 在大数据量时尝试 ArrayFire，失败时保留 NumPy 降级。
+- TDD RED/GREEN：新增 `tests/test_arrayfire_backend.py`，验证 ArrayFire 可用性报告、GPU 双线性重采样与 NumPy 结果一致、auto 后端可降级。
+- 2026-04-29 ArrayFire 几何优化推进：新增 `i2sar.geometry.geometry_arrayfire`，提供 `rdr2geo_arrayfire()` 与 `geo2rdr_arrayfire()` 的静态轨道/常数 Doppler/标量或数组 DEM 原型后端。
+- `AcceleratedRdr2Geo` 与 `AcceleratedGeo2Rdr` 新增显式 `method="arrayfire"` 分支；`auto` 暂不默认选择 ArrayFire，仍使用原有 original/multiprocessing/numba 策略。
+- 新增 `tests/test_arrayfire_geometry.py`，验证 ArrayFire 几何后端 lat/lon 或 range/aztime 与现有 CPU 契约一致，并验证加速入口可显式调用 ArrayFire。
+- 发现 ArrayFire 3.8.3 Python 在当前环境中对 resampler 的二维插值/高级索引会触发 C 层 segfault；已禁用 `Resampler(backend="arrayfire")`，保留 NumPy/Numba 重采样路径。
+- 当前 ArrayFire `rdr2geo` 原型功能可测，但批量 smoke 性能不理想，原因是为匹配现有 CPU 迭代契约保留了 Python 控制循环；后续应先统一 `rdr2geo` 高度语义，再做真正 GPU kernel 化。
+
+## 2026-04-30
+
+- 112 - 代码当前状态分析：运行全量测试 `uv run --extra test pytest -v`。
+- 113 - 测试结果：161个测试，155个通过，6个失败。
+- 114 - 失败测试分析：
+  - `test_geo2rdr_arrayfire_matches_numpy_for_vectorized_static_orbit`：ArrayFire geometry导入缺失 `geo2rdr_arrayfire_core`
+  - `test_geo2rdr_returns_aztime_and_slant_range`：`geo2rdr` 返回 NaN 值
+  - `test_geo2rdr_vectorized_inputs`：向量化输入返回全 NaN
+  - `test_compute_geo2rdr_mapping_returns_grid`：网格映射返回全 NaN
+  - `test_geo2rdr_then_rdr2geo_roundtrip`：往返测试失败
+  - `test_geo2rdr_uses_orbit_interpolator`：使用轨道插值器时返回 NaN
+- 115 - geo2rdr模块存在核心bug：地理坐标到雷达坐标转换逻辑返回NaN，需要检查迭代收敛逻辑或输入参数。
+- 116 - ArrayFire geometry模块导入不完整：`geometry_arrayfire.py` 缺少 `geo2rdr_arrayfire_core` 函数导出。
+- 117 - 当前阶段5b已完成核心模块实现，阶段6（工作流、缓存、断点续跑）待开始。

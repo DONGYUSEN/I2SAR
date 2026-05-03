@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: i2sar
+Version: 0.1.0
+Summary: HDF5-centered SAR/InSAR processing foundation
+Requires-Python: >=3.10
+Requires-Dist: arrayfire>=3.8.0
+Requires-Dist: h5py
+Requires-Dist: numba>=0.65.1
+Requires-Dist: numpy
+Requires-Dist: scipy>=1.15.3
+Requires-Dist: tifffile
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"

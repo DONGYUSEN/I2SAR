@@ -1,0 +1,2 @@
+[console_scripts]
+i2sar = i2sar.cli.main:main
