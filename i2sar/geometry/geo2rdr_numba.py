@@ -43,10 +43,11 @@ def _check_look_side(rvec, vel, pos):
 
 
 @njit(fastmath=True)
-def _find_closest_aztime(target_ecef, sat_positions, sat_velocities, look_side_right):
+def _find_closest_aztime(target_ecef, sat_positions, sat_velocities, sat_times, look_side_right):
     n_positions = len(sat_positions)
     r_closest = 1e16
     idx_closest = 0
+    valid_found = False
     
     for k in range(n_positions):
         pos = sat_positions[k]
@@ -54,16 +55,54 @@ def _find_closest_aztime(target_ecef, sat_positions, sat_velocities, look_side_r
         rvec = target_ecef - pos
         r = _norm(rvec)
         
-        if k == 0:
-            is_valid = _check_look_side(rvec, vel, pos)
-            if look_side_right != is_valid:
-                continue
+        is_valid = _check_look_side(rvec, vel, pos)
+        if look_side_right != is_valid:
+            continue
         
+        valid_found = True
         if r < r_closest:
             r_closest = r
             idx_closest = k
     
-    return float(idx_closest)
+    if not valid_found:
+        return (sat_times[0] + sat_times[-1]) / 2.0
+    
+    return sat_times[idx_closest]
+
+
+@njit(fastmath=True)
+def _linear_interpolate(t, t0, t1, v0, v1):
+    """线性插值"""
+    if t1 == t0:
+        return v0
+    alpha = (t - t0) / (t1 - t0)
+    return v0 + alpha * (v1 - v0)
+
+
+@njit(fastmath=True)
+def _orbit_interpolate(t, sat_times, sat_positions, sat_velocities):
+    """对轨道进行线性插值"""
+    n = len(sat_times)
+    
+    if n == 1:
+        return sat_positions[0], sat_velocities[0]
+    
+    idx = 0
+    for i in range(n - 1):
+        if sat_times[i] <= t <= sat_times[i + 1]:
+            idx = i
+            break
+    
+    if idx == n - 1:
+        idx = n - 2
+    
+    t0 = sat_times[idx]
+    t1 = sat_times[idx + 1]
+    
+    pos = _linear_interpolate(t, t0, t1, sat_positions[idx], sat_positions[idx + 1])
+    vel = _linear_interpolate(t, t0, t1, sat_velocities[idx], sat_velocities[idx + 1])
+    
+    return pos, vel
 
 
 @njit(fastmath=True)
@@ -80,36 +119,19 @@ def _geo2rdr_single_numba(
     
     n_positions = len(sat_positions)
     
-    idx_closest = int(_find_closest_aztime(target_ecef, sat_positions, sat_velocities, look_side_right))
-    
-    if n_positions > 1:
-        t_az = sat_times[idx_closest]
-    else:
-        t_az = sensing_start_s + length / prf_hz / 2.0
+    t_az = _find_closest_aztime(target_ecef, sat_positions, sat_velocities, sat_times, look_side_right)
     
     dt = 0.0
     
     for iteration in range(max_iterations):
         t_az = t_az - dt
         
-        if n_positions > 1:
-            t_min = sat_times[0]
-            t_max = sat_times[-1]
-            t_norm = (t_az - t_min) / (t_max - t_min) if (t_max - t_min) > 0 else 0.0
-            idx = int(min(max(0, t_norm * (n_positions - 1)), n_positions - 1))
-        else:
-            idx = 0
+        t_az = max(sat_times[0], min(t_az, sat_times[-1]))
         
-        sat_pos_i = sat_positions[idx]
-        vel_i = sat_velocities[idx]
+        sat_pos_i, vel_i = _orbit_interpolate(t_az, sat_times, sat_positions, sat_velocities)
         
         rvec = target_ecef - sat_pos_i
         slant_range = _norm(rvec)
-        
-        if iteration == 0:
-            is_valid = _check_look_side(rvec, vel_i, sat_pos_i)
-            if look_side_right != is_valid:
-                break
         
         dopfact = _dot(rvec, vel_i)
         fdop = 0.5 * wavelength * doppler
@@ -124,15 +146,7 @@ def _geo2rdr_single_numba(
         if abs(dt) < threshold:
             break
     
-    if n_positions > 1:
-        t_min = sat_times[0]
-        t_max = sat_times[-1]
-        t_norm = (t_az - t_min) / (t_max - t_min) if (t_max - t_min) > 0 else 0.0
-        idx = int(min(max(0, t_norm * (n_positions - 1)), n_positions - 1))
-    else:
-        idx = 0
-    
-    sat_pos_i = sat_positions[idx]
+    sat_pos_i, vel_i = _orbit_interpolate(t_az, sat_times, sat_positions, sat_velocities)
     rvec = target_ecef - sat_pos_i
     final_range = _norm(rvec)
     
