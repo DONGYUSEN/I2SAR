@@ -5,7 +5,7 @@ from i2sar.geometry.ellipsoid import Ellipsoid, WGS84, ecef_to_llh, llh_to_ecef,
 from i2sar.geometry.look_side import check_look_side, validate_look_side
 from i2sar.geometry.pixel import Pixel
 from i2sar.geometry.radar_grid import SPEED_OF_LIGHT, RadarGrid, read_radar_grid
-from i2sar.geometry.rdr2geo import Rdr2GeoParams, compute_rdr2geo_mapping, rdr2geo
+from i2sar.geometry.rdr2geo import Rdr2GeoParams, Rdr2GeoResult, compute_rdr2geo_mapping, rdr2geo, rdr2geo_full
 from i2sar.geometry.tcn_basis import TCNBasis
 from i2sar.geometry.geo2rdr import compute_geo2rdr_mapping, geo2rdr
 
@@ -17,6 +17,7 @@ __all__ = [
     "Pixel",
     "RadarGrid",
     "Rdr2GeoParams",
+    "Rdr2GeoResult",
     "SPEED_OF_LIGHT",
     "TCNBasis",
     "WGS84",
@@ -27,6 +28,7 @@ __all__ = [
     "geo2rdr",
     "llh_to_ecef",
     "rdr2geo",
+    "rdr2geo_full",
     "validate_look_side",
     "xyz_to_lon_lat",
     "lon_lat_to_xyz",
