@@ -644,22 +644,233 @@ rdr2geo_arrayfire_core = rdr2geo_arrayfire_optimized
 rdr2geo_arrayfire_fast = rdr2geo_arrayfire_adaptive
 
 
-class Geo2RdrGpuContext:
-    def __init__(self, af):
-        self._af = af
-        self._cache = {}
+class Geo2RdrGpuProcessor:
+    """持久化的 Geo2Rdr GPU 处理器，支持数组复用和异步传输"""
     
-    def get_constant(self, name: str, value: float, n_points: int):
-        key = (name, value, n_points)
-        if key not in self._cache:
-            self._cache[key] = self._af.constant(value, n_points, dtype=self._af.Dtype.f64)
-        return self._cache[key]
+    def __init__(self):
+        self._backend = None
+        self._af = None
+        self._initialized = False
+        self._cached_arrays = {}
+        self._last_n_points = 0
+    
+    @property
+    def available(self):
+        if self._backend is None:
+            self._backend = ArrayFireBackend()
+        return self._backend.available
+    
+    def _init_if_needed(self):
+        if not self._initialized:
+            self._backend = ArrayFireBackend()
+            if not self._backend.available:
+                raise RuntimeError(self._backend.reason)
+            self._af = self._backend.module
+            self._initialized = True
+    
+    def _ensure_array_size(self, n_points):
+        """确保缓存的数组大小足够"""
+        if self._last_n_points >= n_points:
+            return
+        
+        af = self._af
+        
+        arrays_to_create = [
+            ('sat_x', n_points), ('sat_y', n_points), ('sat_z', n_points),
+            ('vel_x', n_points), ('vel_y', n_points), ('vel_z', n_points),
+            ('fdop', n_points), ('mid_time', n_points),
+        ]
+        
+        for name, size in arrays_to_create:
+            self._cached_arrays[name] = af.constant(0.0, size, dtype=af.Dtype.f64)
+        
+        self._last_n_points = n_points
+    
+    def process(
+        self,
+        lat: np.ndarray,
+        lon: np.ndarray,
+        height: np.ndarray,
+        radar_grid: RadarGrid,
+        satellite_position: np.ndarray,
+        velocity: np.ndarray,
+        doppler: float = 0.0,
+        ellipsoid: Ellipsoid = WGS84,
+        wavelength_m: float = 0.0565642,
+        max_iterations: int = 50,
+        threshold: float = 1e-8,
+        look_side_right: bool = True,
+    ) -> np.ndarray:
+        self._init_if_needed()
+        af = self._af
+        
+        lat_arr = np.asarray(lat, dtype=np.float64)
+        lon_arr = np.asarray(lon, dtype=np.float64)
+        h_arr = np.asarray(height, dtype=np.float64)
+        n_points = len(lat_arr)
+        
+        if n_points == 0:
+            return np.array([[], []], dtype=np.float64)
+        
+        self._ensure_array_size(n_points)
+        
+        lat_rad = lat_arr * np.pi / 180.0
+        lon_rad = lon_arr * np.pi / 180.0
+        
+        a = ellipsoid.a
+        e2 = ellipsoid.e2
+        
+        re = a / np.sqrt(1.0 - e2 * np.sin(lat_rad) ** 2)
+        x_ecef = (re + h_arr) * np.cos(lat_rad) * np.cos(lon_rad)
+        y_ecef = (re + h_arr) * np.cos(lat_rad) * np.sin(lon_rad)
+        z_ecef = (re * (1.0 - e2) + h_arr) * np.sin(lat_rad)
+        
+        x_ecef_af = asarray(af, x_ecef)
+        y_ecef_af = asarray(af, y_ecef)
+        z_ecef_af = asarray(af, z_ecef)
+        
+        sat_x_af = self._cached_arrays['sat_x']
+        sat_y_af = self._cached_arrays['sat_y']
+        sat_z_af = self._cached_arrays['sat_z']
+        vel_x_af = self._cached_arrays['vel_x']
+        vel_y_af = self._cached_arrays['vel_y']
+        vel_z_af = self._cached_arrays['vel_z']
+        
+        af.write(sat_x_af, af.constant(float(satellite_position[0]), n_points, dtype=af.Dtype.f64))
+        af.write(sat_y_af, af.constant(float(satellite_position[1]), n_points, dtype=af.Dtype.f64))
+        af.write(sat_z_af, af.constant(float(satellite_position[2]), n_points, dtype=af.Dtype.f64))
+        af.write(vel_x_af, af.constant(float(velocity[0]), n_points, dtype=af.Dtype.f64))
+        af.write(vel_y_af, af.constant(float(velocity[1]), n_points, dtype=af.Dtype.f64))
+        af.write(vel_z_af, af.constant(float(velocity[2]), n_points, dtype=af.Dtype.f64))
+        
+        dr_x = x_ecef_af - sat_x_af
+        dr_y = y_ecef_af - sat_y_af
+        dr_z = z_ecef_af - sat_z_af
+        
+        slant_range_af = af.sqrt(dr_x * dr_x + dr_y * dr_y + dr_z * dr_z)
+        
+        mid_time = float(radar_grid.start_time + radar_grid.number_of_seconds / 2.0)
+        aztime_af = af.constant(mid_time, n_points, dtype=af.Dtype.f64)
+        
+        cross_x_af = dr_y * vel_z_af - dr_z * vel_y_af
+        cross_y_af = dr_z * vel_x_af - dr_x * vel_z_af
+        cross_z_af = dr_x * vel_y_af - dr_y * vel_x_af
+        
+        dot_product_af = cross_x_af * sat_x_af + cross_y_af * sat_y_af + cross_z_af * sat_z_af
+        is_right_side_af = dot_product_af > 0
+        
+        if look_side_right:
+            valid_mask_af = is_right_side_af
+        else:
+            valid_mask_af = ~is_right_side_af
+        
+        fdop_val = 0.5 * wavelength_m * doppler
+        fdop_af = af.constant(fdop_val, n_points, dtype=af.Dtype.f64)
+        
+        vel_dot_vel = vel_x_af * vel_x_af + vel_y_af * vel_y_af + vel_z_af * vel_z_af
+        c1_af = -vel_dot_vel
+        
+        dt_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
+        
+        for iteration in range(max_iterations):
+            aztime_af = aztime_af - dt_af
+            
+            dopfact_af = dr_x * vel_x_af + dr_y * vel_y_af + dr_z * vel_z_af
+            c2_af = fdop_af / slant_range_af
+            fnprime_af = c1_af + c2_af * dopfact_af
+            
+            fn_af = dopfact_af - fdop_af * slant_range_af
+            
+            dt_af = af.select(fnprime_af != 0, fn_af / fnprime_af, 0.0)
+            dt_af = af.select(valid_mask_af, dt_af, 0.0)
+            
+            af.eval(dt_af)
+            
+            if iteration % 10 == 0 or iteration == max_iterations - 1:
+                max_dt = float(af.max(af.abs(dt_af)))
+                if max_dt < threshold:
+                    break
+        
+        af.eval(aztime_af, slant_range_af)
+        af.sync()
+        
+        aztime_np = to_numpy(aztime_af)
+        range_np = to_numpy(slant_range_af)
+        
+        result = np.stack([aztime_np, range_np], axis=0)
+        
+        if n_points == 1:
+            return result[:, 0]
+        
+        return result
     
     def clear_cache(self):
-        self._cache.clear()
+        self._cached_arrays.clear()
+        self._last_n_points = 0
 
 
-def geo2rdr_arrayfire_core(
+_geo2rdr_processor = None
+
+
+def get_geo2rdr_processor() -> Geo2RdrGpuProcessor:
+    """获取全局的 Geo2Rdr GPU 处理器实例"""
+    global _geo2rdr_processor
+    if _geo2rdr_processor is None:
+        _geo2rdr_processor = Geo2RdrGpuProcessor()
+    return _geo2rdr_processor
+
+
+def geo2rdr_arrayfire_core_optimized(
+    lat: Union[int, float, np.ndarray],
+    lon: Union[int, float, np.ndarray],
+    height: Union[int, float, np.ndarray],
+    radar_grid: RadarGrid,
+    satellite_position: Union[np.ndarray, OrbitInterpolator],
+    velocity: Union[np.ndarray, None] = None,
+    doppler: float = 0.0,
+    ellipsoid: Ellipsoid = WGS84,
+    wavelength_m: float = 0.0565642,
+    max_iterations: int = 50,
+    threshold: float = 1e-8,
+    delta_range: float = 10.0,
+    look_side_right: bool = True,
+    use_processor: bool = True,
+) -> np.ndarray:
+    """优化版 geo2rdr，支持持久化处理器和异步传输"""
+    
+    if isinstance(satellite_position, OrbitInterpolator):
+        return _geo2rdr_arrayfire_with_orbit_new(
+            lat, lon, height, radar_grid, satellite_position,
+            doppler, wavelength_m, max_iterations, threshold,
+            look_side_right
+        )
+    
+    if use_processor:
+        processor = get_geo2rdr_processor()
+        if processor.available:
+            return processor.process(
+                lat=np.atleast_1d(np.asarray(lat, dtype=np.float64)),
+                lon=np.atleast_1d(np.asarray(lon, dtype=np.float64)),
+                height=np.atleast_1d(np.asarray(height, dtype=np.float64)),
+                radar_grid=radar_grid,
+                satellite_position=np.asarray(satellite_position, dtype=np.float64),
+                velocity=np.asarray(velocity, dtype=np.float64),
+                doppler=doppler,
+                ellipsoid=ellipsoid,
+                wavelength_m=wavelength_m,
+                max_iterations=max_iterations,
+                threshold=threshold,
+                look_side_right=look_side_right,
+            )
+    
+    return geo2rdr_arrayfire_core_fallback(
+        lat, lon, height, radar_grid, satellite_position, velocity,
+        doppler, ellipsoid, wavelength_m, max_iterations, threshold,
+        delta_range, look_side_right
+    )
+
+
+def geo2rdr_arrayfire_core_fallback(
     lat: Union[int, float, np.ndarray],
     lon: Union[int, float, np.ndarray],
     height: Union[int, float, np.ndarray],
@@ -674,6 +885,7 @@ def geo2rdr_arrayfire_core(
     delta_range: float = 10.0,
     look_side_right: bool = True,
 ) -> np.ndarray:
+    """原始实现作为 fallback"""
     backend = ArrayFireBackend()
     if not backend.available:
         raise RuntimeError(backend.reason)
@@ -702,104 +914,110 @@ def geo2rdr_arrayfire_core(
     y_ecef_af = asarray(af, y_ecef)
     z_ecef_af = asarray(af, z_ecef)
     
-    if isinstance(satellite_position, OrbitInterpolator):
-        return _geo2rdr_arrayfire_with_orbit(
-            x_ecef_af, y_ecef_af, z_ecef_af,
-            n_points, radar_grid, satellite_position,
-            doppler, wavelength_m, max_iterations, threshold,
-            af, look_side_right
-        )
+    sat_pos_x_af = af.constant(float(satellite_position[0]), n_points, dtype=af.Dtype.f64)
+    sat_pos_y_af = af.constant(float(satellite_position[1]), n_points, dtype=af.Dtype.f64)
+    sat_pos_z_af = af.constant(float(satellite_position[2]), n_points, dtype=af.Dtype.f64)
+    
+    vel_x_af = af.constant(float(velocity[0]), n_points, dtype=af.Dtype.f64)
+    vel_y_af = af.constant(float(velocity[1]), n_points, dtype=af.Dtype.f64)
+    vel_z_af = af.constant(float(velocity[2]), n_points, dtype=af.Dtype.f64)
+    
+    dr_x = x_ecef_af - sat_pos_x_af
+    dr_y = y_ecef_af - sat_pos_y_af
+    dr_z = z_ecef_af - sat_pos_z_af
+    
+    slant_range_af = af.sqrt(dr_x * dr_x + dr_y * dr_y + dr_z * dr_z)
+    
+    mid_time = float(radar_grid.start_time + radar_grid.number_of_seconds / 2.0)
+    aztime_af = af.constant(mid_time, n_points, dtype=af.Dtype.f64)
+    
+    cross_x_af = dr_y * vel_z_af - dr_z * vel_y_af
+    cross_y_af = dr_z * vel_x_af - dr_x * vel_z_af
+    cross_z_af = dr_x * vel_y_af - dr_y * vel_x_af
+    
+    dot_product_af = cross_x_af * sat_pos_x_af + cross_y_af * sat_pos_y_af + cross_z_af * sat_pos_z_af
+    is_right_side_af = dot_product_af > 0
+    
+    if look_side_right:
+        valid_mask_af = is_right_side_af
     else:
-        ctx = Geo2RdrGpuContext(af)
-        
-        sat_pos_x_af = ctx.get_constant('sat_x', float(satellite_position[0]), n_points)
-        sat_pos_y_af = ctx.get_constant('sat_y', float(satellite_position[1]), n_points)
-        sat_pos_z_af = ctx.get_constant('sat_z', float(satellite_position[2]), n_points)
-        
-        vel_x_af = ctx.get_constant('vel_x', float(velocity[0]), n_points)
-        vel_y_af = ctx.get_constant('vel_y', float(velocity[1]), n_points)
-        vel_z_af = ctx.get_constant('vel_z', float(velocity[2]), n_points)
-        
-        dr_x = x_ecef_af - sat_pos_x_af
-        dr_y = y_ecef_af - sat_pos_y_af
-        dr_z = z_ecef_af - sat_pos_z_af
-        
-        slant_range_af = af.sqrt(dr_x * dr_x + dr_y * dr_y + dr_z * dr_z)
-        
-        mid_time = float(radar_grid.start_time + radar_grid.number_of_seconds / 2.0)
-        aztime_af = ctx.get_constant('mid_time', mid_time, n_points)
-        
-        cross_x_af = dr_y * vel_z_af - dr_z * vel_y_af
-        cross_y_af = dr_z * vel_x_af - dr_x * vel_z_af
-        cross_z_af = dr_x * vel_y_af - dr_y * vel_x_af
-        
-        dot_product_af = cross_x_af * sat_pos_x_af + cross_y_af * sat_pos_y_af + cross_z_af * sat_pos_z_af
-        
-        is_right_side_af = dot_product_af > 0
-        
-        if look_side_right:
-            valid_mask_af = is_right_side_af
-        else:
-            valid_mask_af = ~is_right_side_af
-        
-        fdop_val = 0.5 * wavelength_m * doppler
-        fdop_af = ctx.get_constant('fdop', fdop_val, n_points)
-        
-        vel_dot_vel = vel_x_af * vel_x_af + vel_y_af * vel_y_af + vel_z_af * vel_z_af
-        c1_af = -vel_dot_vel
-        
-        dt_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
-        
-        for iteration in range(max_iterations):
-            aztime_af = aztime_af - dt_af
-            
-            dopfact_af = dr_x * vel_x_af + dr_y * vel_y_af + dr_z * vel_z_af
-            c2_af = fdop_af / slant_range_af
-            fnprime_af = c1_af + c2_af * dopfact_af
-            
-            fn_af = dopfact_af - fdop_af * slant_range_af
-            
-            dt_af = af.select(fnprime_af != 0, fn_af / fnprime_af, 0.0)
-            dt_af = af.select(valid_mask_af, dt_af, 0.0)
-            
-            af.eval(dt_af)
-            
-            if iteration % 5 == 0 or iteration == max_iterations - 1:
-                max_dt = float(af.max(af.abs(dt_af)))
-                if max_dt < threshold:
-                    break
-        
-        af.eval(aztime_af, slant_range_af)
-        af.sync()
-        
-        aztime_np = to_numpy(aztime_af)
-        range_np = to_numpy(slant_range_af)
-        
-        ctx.clear_cache()
-        
-        result = np.stack([aztime_np, range_np], axis=0)
-        
-        if n_points == 1:
-            return result[:, 0]
-        
-        return result
-
-
-def _geo2rdr_arrayfire_with_orbit(
-    x_ecef_af, y_ecef_af, z_ecef_af,
-    n_points: int, radar_grid: RadarGrid,
-    orbit: OrbitInterpolator, doppler: float,
-    wavelength_m: float, max_iterations: int,
-    threshold: float, af,
-    look_side_right: bool = True
-) -> np.ndarray:
-    t_az_af = af.constant(
-        radar_grid.start_time + radar_grid.number_of_seconds / 2.0,
-        n_points, dtype=af.Dtype.f64
-    )
+        valid_mask_af = ~is_right_side_af
     
     fdop_val = 0.5 * wavelength_m * doppler
     fdop_af = af.constant(fdop_val, n_points, dtype=af.Dtype.f64)
+    
+    vel_dot_vel = vel_x_af * vel_x_af + vel_y_af * vel_y_af + vel_z_af * vel_z_af
+    c1_af = -vel_dot_vel
+    
+    dt_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
+    
+    for iteration in range(max_iterations):
+        aztime_af = aztime_af - dt_af
+        
+        dopfact_af = dr_x * vel_x_af + dr_y * vel_y_af + dr_z * vel_z_af
+        c2_af = fdop_af / slant_range_af
+        fnprime_af = c1_af + c2_af * dopfact_af
+        
+        fn_af = dopfact_af - fdop_af * slant_range_af
+        
+        dt_af = af.select(fnprime_af != 0, fn_af / fnprime_af, 0.0)
+        dt_af = af.select(valid_mask_af, dt_af, 0.0)
+        
+        af.eval(dt_af)
+        
+        if iteration % 10 == 0 or iteration == max_iterations - 1:
+            max_dt = float(af.max(af.abs(dt_af)))
+            if max_dt < threshold:
+                break
+    
+    af.eval(aztime_af, slant_range_af)
+    af.sync()
+    
+    aztime_np = to_numpy(aztime_af)
+    range_np = to_numpy(slant_range_af)
+    
+    result = np.stack([aztime_np, range_np], axis=0)
+    
+    if n_points == 1:
+        return result[:, 0]
+    
+    return result
+
+
+def _geo2rdr_arrayfire_with_orbit_new(
+    lat, lon, height, radar_grid: RadarGrid,
+    orbit: OrbitInterpolator, doppler: float,
+    wavelength_m: float, max_iterations: int,
+    threshold: float, look_side_right: bool = True
+) -> np.ndarray:
+    """优化版轨道插值器处理，减少数据传输"""
+    backend = ArrayFireBackend()
+    if not backend.available:
+        raise RuntimeError(backend.reason)
+    af = backend.module
+    
+    lat_arr = np.atleast_1d(np.asarray(lat, dtype=np.float64))
+    lon_arr = np.atleast_1d(np.asarray(lon, dtype=np.float64))
+    h_arr = np.atleast_1d(np.asarray(height, dtype=np.float64))
+    n_points = len(lat_arr)
+    
+    if n_points == 0:
+        return np.array([[], []], dtype=np.float64)
+    
+    lat_rad = lat_arr * np.pi / 180.0
+    lon_rad = lon_arr * np.pi / 180.0
+    
+    a = WGS84.a
+    e2 = WGS84.e2
+    
+    re = a / np.sqrt(1.0 - e2 * np.sin(lat_rad) ** 2)
+    x_ecef = (re + h_arr) * np.cos(lat_rad) * np.cos(lon_rad)
+    y_ecef = (re + h_arr) * np.cos(lat_rad) * np.sin(lon_rad)
+    z_ecef = (re * (1.0 - e2) + h_arr) * np.sin(lat_rad)
+    
+    x_ecef_af = asarray(af, x_ecef)
+    y_ecef_af = asarray(af, y_ecef)
+    z_ecef_af = asarray(af, z_ecef)
     
     sat_x_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
     sat_y_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
@@ -807,6 +1025,14 @@ def _geo2rdr_arrayfire_with_orbit(
     vel_x_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
     vel_y_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
     vel_z_af = af.constant(0.0, n_points, dtype=af.Dtype.f64)
+    
+    t_az_af = af.constant(
+        radar_grid.start_time + radar_grid.number_of_seconds / 2.0,
+        n_points, dtype=af.Dtype.f64
+    )
+    
+    fdop_val = 0.5 * wavelength_m * doppler
+    fdop_af = af.constant(fdop_val, n_points, dtype=af.Dtype.f64)
     
     t_az_np = to_numpy(t_az_af)
     orbit_state = orbit.state_at(t_az_np, allow_extrapolation=True)
@@ -856,7 +1082,7 @@ def _geo2rdr_arrayfire_with_orbit(
         
         af.eval(dt_af)
         
-        if iteration % 5 == 0 or iteration == max_iterations - 1:
+        if iteration % 10 == 0 or iteration == max_iterations - 1:
             max_dt = float(af.max(af.abs(dt_af)))
             if max_dt < threshold:
                 break
@@ -893,7 +1119,7 @@ def _geo2rdr_arrayfire_with_orbit(
     return result
 
 
-def geo2rdr_arrayfire_chunked(
+def geo2rdr_arrayfire_chunked_optimized(
     lat: np.ndarray,
     lon: np.ndarray,
     height: np.ndarray,
@@ -907,6 +1133,66 @@ def geo2rdr_arrayfire_chunked(
     threshold: float = 1e-8,
     chunk_size: int = 65536,
 ) -> np.ndarray:
+    """优化版分块处理，使用持久化处理器"""
+    if isinstance(satellite_position, OrbitInterpolator):
+        return geo2rdr_arrayfire_chunked_fallback(
+            lat, lon, height, radar_grid, satellite_position, velocity,
+            doppler, ellipsoid, wavelength_m, max_iterations, threshold, chunk_size
+        )
+    
+    processor = get_geo2rdr_processor()
+    if not processor.available:
+        return geo2rdr_arrayfire_chunked_fallback(
+            lat, lon, height, radar_grid, satellite_position, velocity,
+            doppler, ellipsoid, wavelength_m, max_iterations, threshold, chunk_size
+        )
+    
+    n_points = len(lat)
+    result_az = np.zeros(n_points, dtype=np.float64)
+    result_range = np.zeros(n_points, dtype=np.float64)
+    
+    num_chunks = (n_points + chunk_size - 1) // chunk_size
+    
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, n_points)
+        
+        chunk_result = processor.process(
+            lat=lat[start_idx:end_idx],
+            lon=lon[start_idx:end_idx],
+            height=height[start_idx:end_idx],
+            radar_grid=radar_grid,
+            satellite_position=np.asarray(satellite_position, dtype=np.float64),
+            velocity=np.asarray(velocity, dtype=np.float64),
+            doppler=doppler,
+            ellipsoid=ellipsoid,
+            wavelength_m=wavelength_m,
+            max_iterations=max_iterations,
+            threshold=threshold,
+            look_side_right=True,
+        )
+        
+        result_az[start_idx:end_idx] = chunk_result[0]
+        result_range[start_idx:end_idx] = chunk_result[1]
+    
+    return np.stack([result_az, result_range], axis=0)
+
+
+def geo2rdr_arrayfire_chunked_fallback(
+    lat: np.ndarray,
+    lon: np.ndarray,
+    height: np.ndarray,
+    radar_grid: RadarGrid,
+    satellite_position: Union[np.ndarray, OrbitInterpolator],
+    velocity: Union[np.ndarray, None] = None,
+    doppler: float = 0.0,
+    ellipsoid: Ellipsoid = WGS84,
+    wavelength_m: float = 0.0565642,
+    max_iterations: int = 50,
+    threshold: float = 1e-8,
+    chunk_size: int = 65536,
+) -> np.ndarray:
+    """分块处理的 fallback 版本"""
     backend = ArrayFireBackend()
     if not backend.available:
         raise RuntimeError(backend.reason)
@@ -921,7 +1207,7 @@ def geo2rdr_arrayfire_chunked(
         start_idx = i * chunk_size
         end_idx = min((i + 1) * chunk_size, n_points)
         
-        chunk_result = geo2rdr_arrayfire_core(
+        chunk_result = geo2rdr_arrayfire_core_fallback(
             lat=lat[start_idx:end_idx],
             lon=lon[start_idx:end_idx],
             height=height[start_idx:end_idx],
@@ -939,3 +1225,4 @@ def geo2rdr_arrayfire_chunked(
         result_range[start_idx:end_idx] = chunk_result[1]
     
     return np.stack([result_az, result_range], axis=0)
+geo2rdr_arrayfire_core = geo2rdr_arrayfire_core_fallback
