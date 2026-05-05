@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
+import zipfile
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, Optional, Tuple
@@ -21,6 +23,7 @@ from i2sar.project import Project
 from i2sar.io import import_scene
 from i2sar.geometry.radar_grid import RadarGrid
 from i2sar.geometry.accelerated_geometry import rdr2geo_fast, geo2rdr_fast
+from i2sar.dem.hdf import read_hgt, write_dem_hdf
 from i2sar.dem.interpolator import DEMInterpolator
 from i2sar.dem.sampling import sample_dem_at_latlons
 from i2sar.orbit.interpolate import read_orbit_interpolator
@@ -35,6 +38,48 @@ from i2sar.accel.arrayfire_filtering import (
     phase_unwrap_gpu,
     arrayfire_available as af_filter_available,
 )
+
+
+def _extract_hgt_from_zip(zip_path: Path, out_dir: Path) -> Path:
+    with zipfile.ZipFile(zip_path) as zf:
+        members = [name for name in zf.namelist() if name.lower().endswith(".hgt")]
+        if not members:
+            raise ValueError(f"DEM zip has no .hgt member: {zip_path}")
+        member = members[0]
+        out_path = out_dir / Path(member).name
+        with zf.open(member) as src, out_path.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+    return out_path
+
+
+def _ensure_dem_hdf_path(dem_path: str, work_dir: str) -> str:
+    src_path = Path(dem_path)
+    suffixes = [s.lower() for s in src_path.suffixes]
+    if suffixes and suffixes[-1] in {".h5", ".hdf5"}:
+        return str(src_path)
+
+    work_root = Path(work_dir)
+    work_root.mkdir(parents=True, exist_ok=True)
+
+    if suffixes[-2:] == [".hgt", ".zip"] or (suffixes and suffixes[-1] == ".zip"):
+        hgt_path = _extract_hgt_from_zip(src_path, work_root)
+    elif suffixes and suffixes[-1] == ".hgt":
+        hgt_path = src_path
+    else:
+        raise ValueError(f"Unsupported DEM format: {dem_path}")
+
+    elevation, geotransform, bbox = read_hgt(hgt_path)
+    dem_h5 = work_root / f"{hgt_path.stem}_dem.h5"
+    write_dem_hdf(
+        dem_h5,
+        dem_id=f"dem_{hgt_path.stem.lower()}",
+        elevation=elevation,
+        geotransform=geotransform,
+        bbox=bbox,
+        source={"type": "hgt", "path": str(hgt_path)},
+        margin_deg=0.0,
+    )
+    return str(dem_h5)
 
 
 def import_source_to_h5(source_path: str, sensor: str, work_dir: str, scene_name: str = "scene") -> str:
@@ -270,18 +315,16 @@ class StripInSARProcessor:
         inc_angle = np.arccos(np.clip(cos_inc, -1.0, 1.0))
         
         return inc_angle
-    
-    def stage_geo2rdr(self, prep_result: StageResult, topo_result: StageResult, dem_path: str) -> StageResult:
-        print("[geo2rdr] 执行地理坐标到雷达坐标转换（粗配准）...")
-        
-        master_grid = prep_result.outputs["master_grid"]
-        slave_grid = prep_result.outputs["slave_grid"]
-        slave_orbit = prep_result.outputs["slave_orbit"]
-        
-        lats = topo_result.outputs["lat"]
-        lons = topo_result.outputs["lon"]
-        heights = topo_result.outputs["height"]
-        
+
+    def _compute_slave_geo2rdr_offset(
+        self,
+        master_grid: RadarGrid,
+        slave_grid: RadarGrid,
+        slave_orbit,
+        lats: np.ndarray,
+        lons: np.ndarray,
+        heights: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
         aztimes, slant_ranges = geo2rdr_fast(
             lat=lats.flatten(),
             lon=lons.flatten(),
@@ -290,46 +333,143 @@ class StripInSARProcessor:
             satellite_position=slave_orbit,
             velocity=None,
             doppler=0.0,
-            method="auto"
+            method="auto",
         )
-        
-        lines = slave_grid.azimuth_time_to_line(aztimes)
-        pixels = slave_grid.slant_range_to_pixel(slant_ranges)
-        
-        lines = lines.reshape(lats.shape)
-        pixels = pixels.reshape(lons.shape)
-        
-        valid_mask = ~(np.isnan(lines) | np.isnan(pixels))
-        
-        lines = np.nan_to_num(lines, nan=0.0)
-        pixels = np.nan_to_num(pixels, nan=0.0)
-        
-        az_offset = lines - np.arange(master_grid.length).reshape(-1, 1)
-        rg_offset = pixels - np.arange(master_grid.width).reshape(1, -1)
-        
+
+        lines = slave_grid.azimuth_time_to_line(aztimes).reshape(lats.shape)
+        pixels = slave_grid.slant_range_to_pixel(slant_ranges).reshape(lats.shape)
+        valid_mask = np.isfinite(lines) & np.isfinite(pixels)
+
+        row_index = np.arange(master_grid.length).reshape(-1, 1)
+        col_index = np.arange(master_grid.width).reshape(1, -1)
+        az_offset = lines - row_index
+        rg_offset = pixels - col_index
         az_offset[~valid_mask] = np.nan
         rg_offset[~valid_mask] = np.nan
+        return az_offset, rg_offset, {"lines": lines, "pixels": pixels, "valid_mask": valid_mask}
+
+    def _compute_master_rdrdem_offset(
+        self,
+        master_grid: RadarGrid,
+        master_orbit,
+        lats: np.ndarray,
+        lons: np.ndarray,
+        heights: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        aztimes, slant_ranges = geo2rdr_fast(
+            lat=lats.flatten(),
+            lon=lons.flatten(),
+            height=heights.flatten(),
+            radar_grid=master_grid,
+            satellite_position=master_orbit,
+            velocity=None,
+            doppler=0.0,
+            method="auto",
+        )
+        lines = master_grid.azimuth_time_to_line(aztimes).reshape(lats.shape)
+        pixels = master_grid.slant_range_to_pixel(slant_ranges).reshape(lats.shape)
+        valid_mask = np.isfinite(lines) & np.isfinite(pixels)
+        row_index = np.arange(master_grid.length).reshape(-1, 1)
+        col_index = np.arange(master_grid.width).reshape(1, -1)
+        az_offset = lines - row_index
+        rg_offset = pixels - col_index
+        az_offset[~valid_mask] = np.nan
+        rg_offset[~valid_mask] = np.nan
+        return az_offset, rg_offset, {"valid_mask": valid_mask, "affine": [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]}
+
+    def _rectify_range_offset(self, rg_offset: np.ndarray, valid_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        rectified = np.asarray(rg_offset, dtype=np.float64).copy()
+        rect_valid = valid_mask & np.isfinite(rectified) & (np.abs(rectified) <= 1.0e5)
+        fill_value = 0.0
+        if np.any(rect_valid):
+            fill_value = float(np.nanmedian(rectified[rect_valid]))
+        rectified[~rect_valid] = fill_value
+        return rectified, rect_valid
+
+    def _merge_geo_offsets(
+        self,
+        slave_az: np.ndarray,
+        slave_rg: np.ndarray,
+        slave_valid: np.ndarray,
+        rdrdem_az: np.ndarray,
+        rdrdem_rg: np.ndarray,
+        rdrdem_valid: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        merged_valid = slave_valid & rdrdem_valid
+        merged_az = np.asarray(slave_az - rdrdem_az, dtype=np.float64)
+        merged_rg = np.asarray(slave_rg - rdrdem_rg, dtype=np.float64)
+        merged_az[~merged_valid] = np.nan
+        merged_rg[~merged_valid] = np.nan
+        return merged_az, merged_rg, merged_valid
+    
+    def stage_geo2rdr(self, prep_result: StageResult, topo_result: StageResult, dem_path: str) -> StageResult:
+        print("[geo2rdr] 执行地理坐标到雷达坐标转换（粗配准）...")
+        
+        master_grid = prep_result.outputs["master_grid"]
+        slave_grid = prep_result.outputs["slave_grid"]
+        master_orbit = prep_result.outputs["master_orbit"]
+        slave_orbit = prep_result.outputs["slave_orbit"]
+        
+        lats = topo_result.outputs["lat"]
+        lons = topo_result.outputs["lon"]
+        heights = topo_result.outputs["height"]
+
+        slave_az_offset, slave_rg_offset, slave_meta = self._compute_slave_geo2rdr_offset(
+            master_grid=master_grid,
+            slave_grid=slave_grid,
+            slave_orbit=slave_orbit,
+            lats=lats,
+            lons=lons,
+            heights=heights,
+        )
+        rdrdem_az_offset, rdrdem_rg_offset, rdrdem_meta = self._compute_master_rdrdem_offset(
+            master_grid=master_grid,
+            master_orbit=master_orbit,
+            lats=lats,
+            lons=lons,
+            heights=heights,
+        )
+        merged_az_offset, merged_rg_offset, merged_valid = self._merge_geo_offsets(
+            slave_az=slave_az_offset,
+            slave_rg=slave_rg_offset,
+            slave_valid=slave_meta["valid_mask"],
+            rdrdem_az=rdrdem_az_offset,
+            rdrdem_rg=rdrdem_rg_offset,
+            rdrdem_valid=rdrdem_meta["valid_mask"],
+        )
+        rectified_rg_offset, rect_valid = self._rectify_range_offset(merged_rg_offset, merged_valid)
+        final_valid_mask = merged_valid & rect_valid
+        final_az_offset = merged_az_offset.copy()
+        final_rg_offset = rectified_rg_offset.copy()
+        final_az_offset[~final_valid_mask] = np.nan
+        final_rg_offset[~final_valid_mask] = np.nan
         
         stage_dir = self._stage_dir("geo2rdr")
         stage_dir.mkdir(parents=True, exist_ok=True)
         with h5py.File(stage_dir / "geo2rdr.h5", 'w') as h5:
-            h5.create_dataset("lines", data=lines)
-            h5.create_dataset("pixels", data=pixels)
-            h5.create_dataset("az_offset", data=az_offset)
-            h5.create_dataset("rg_offset", data=rg_offset)
-            h5.create_dataset("valid_mask", data=valid_mask)
+            h5.create_dataset("lines", data=slave_meta["lines"])
+            h5.create_dataset("pixels", data=slave_meta["pixels"])
+            h5.create_dataset("az_offset", data=final_az_offset)
+            h5.create_dataset("rg_offset", data=final_rg_offset)
+            h5.create_dataset("rdrdem_az_offset", data=rdrdem_az_offset)
+            h5.create_dataset("rdrdem_rg_offset", data=rdrdem_rg_offset)
+            h5.create_dataset("merged_az_offset", data=merged_az_offset)
+            h5.create_dataset("merged_rg_offset", data=merged_rg_offset)
+            h5.create_dataset("rectified_range_offset", data=rectified_rg_offset)
+            h5.create_dataset("valid_mask", data=final_valid_mask)
         
-        self._save_offset_images(stage_dir, az_offset, rg_offset, valid_mask)
+        self._save_offset_images(stage_dir, final_az_offset, final_rg_offset, final_valid_mask)
         
-        valid_az_offset = az_offset[valid_mask]
-        valid_rg_offset = rg_offset[valid_mask]
+        valid_az_offset = final_az_offset[final_valid_mask]
+        valid_rg_offset = final_rg_offset[final_valid_mask]
         
         record = {
             "shape": lats.shape,
             "mean_az_offset": float(np.mean(valid_az_offset)) if valid_az_offset.size > 0 else np.nan,
             "mean_rg_offset": float(np.mean(valid_rg_offset)) if valid_rg_offset.size > 0 else np.nan,
-            "valid_points": int(np.sum(valid_mask)),
+            "valid_points": int(np.sum(final_valid_mask)),
             "total_points": int(np.prod(lats.shape)),
+            "rdrdem_affine": rdrdem_meta.get("affine"),
         }
         self._write_stage_record("geo2rdr", record)
         self._mark_stage_success("geo2rdr")
@@ -338,19 +478,28 @@ class StripInSARProcessor:
         return StageResult(
             success=True,
             outputs={
-                "lines": lines,
-                "pixels": pixels,
-                "az_offset": az_offset,
-                "rg_offset": rg_offset,
-                "valid_mask": valid_mask,
+                "lines": slave_meta["lines"],
+                "pixels": slave_meta["pixels"],
+                "az_offset": final_az_offset,
+                "rg_offset": final_rg_offset,
+                "rdrdem_az_offset": rdrdem_az_offset,
+                "rdrdem_rg_offset": rdrdem_rg_offset,
+                "merged_az_offset": merged_az_offset,
+                "merged_rg_offset": merged_rg_offset,
+                "rectified_range_offset": rectified_rg_offset,
+                "valid_mask": final_valid_mask,
             },
             metadata=record
         )
     
     def _save_offset_images(self, stage_dir, az_offset, rg_offset, valid_mask):
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except Exception:
+            print("[geo2rdr] matplotlib 不可用，跳过偏移图输出")
+            return
         
         rg_offset_display = np.copy(rg_offset)
         rg_offset_display[~valid_mask] = np.nan
@@ -394,8 +543,9 @@ class StripInSARProcessor:
                 metadata={"status": "skipped"}
             )
         
-        az_offset = geo2rdr_result.outputs["az_offset"]
-        rg_offset = geo2rdr_result.outputs["rg_offset"]
+        az_offset = geo2rdr_result.outputs.get("merged_az_offset", geo2rdr_result.outputs["az_offset"])
+        rg_offset = geo2rdr_result.outputs.get("merged_rg_offset", geo2rdr_result.outputs["rg_offset"])
+        rectified_range = geo2rdr_result.outputs.get("rectified_range_offset", rg_offset)
         
         master_slc = self._to_complex(master_slc)
         slave_slc = self._to_complex(slave_slc)
@@ -421,6 +571,9 @@ class StripInSARProcessor:
             success=True,
             outputs={
                 "resampled_slave": resampled_slave,
+                "base_az_offset": az_offset,
+                "base_rg_offset": rg_offset,
+                "rectified_range_offset": rectified_range,
             },
             metadata=record
         )
@@ -631,10 +784,13 @@ class StripInSARProcessor:
         slave_slc = prep_result.outputs["slave_slc"]
         master_grid = prep_result.outputs["master_grid"]
         resampled_slave = coarse_result.outputs["resampled_slave"]
-        az_offset = refine_result.outputs["az_offset"]
-        rg_offset = refine_result.outputs["rg_offset"]
+        refine_az = refine_result.outputs["az_offset"]
+        refine_rg = refine_result.outputs["rg_offset"]
+        base_az = coarse_result.outputs.get("base_az_offset")
+        base_rg = coarse_result.outputs.get("base_rg_offset")
+        rectified_rg = coarse_result.outputs.get("rectified_range_offset")
         
-        if slave_slc is None or resampled_slave is None or az_offset is None:
+        if slave_slc is None or resampled_slave is None or refine_az is None:
             print("[refined_resample] 警告：使用粗重采样结果")
             self._mark_stage_success("refined_resample")
             return StageResult(
@@ -647,6 +803,18 @@ class StripInSARProcessor:
         
         num_rows = master_grid.length
         num_cols = master_grid.width
+
+        if base_az is None:
+            base_az = np.zeros_like(refine_az, dtype=np.float64)
+        if rectified_rg is not None:
+            base_rg = rectified_rg
+        elif base_rg is None:
+            base_rg = np.zeros_like(refine_rg, dtype=np.float64)
+
+        az_offset = np.asarray(base_az + refine_az, dtype=np.float64)
+        rg_offset = np.asarray(base_rg + refine_rg, dtype=np.float64)
+        az_offset = np.nan_to_num(az_offset, nan=0.0, posinf=0.0, neginf=0.0)
+        rg_offset = np.nan_to_num(rg_offset, nan=0.0, posinf=0.0, neginf=0.0)
         
         if self.use_gpu:
             refined_slave = self._refined_resample_gpu(slave_slc, az_offset, rg_offset, num_rows, num_cols)
@@ -680,11 +848,14 @@ class StripInSARProcessor:
         sample_rows = grid_rows + az_offset
         sample_cols = grid_cols + rg_offset
         
+        finite_mask = np.isfinite(sample_rows) & np.isfinite(sample_cols)
         valid_mask = (sample_rows >= 0) & (sample_rows < slave_slc.shape[0] - 1) & \
-                     (sample_cols >= 0) & (sample_cols < slave_slc.shape[1] - 1)
+                     (sample_cols >= 0) & (sample_cols < slave_slc.shape[1] - 1) & finite_mask
         
-        sample_rows_clipped = np.clip(sample_rows, 0, slave_slc.shape[0] - 2)
-        sample_cols_clipped = np.clip(sample_cols, 0, slave_slc.shape[1] - 2)
+        sample_rows_safe = np.nan_to_num(sample_rows, nan=0.0, posinf=0.0, neginf=0.0)
+        sample_cols_safe = np.nan_to_num(sample_cols, nan=0.0, posinf=0.0, neginf=0.0)
+        sample_rows_clipped = np.clip(sample_rows_safe, 0, slave_slc.shape[0] - 2)
+        sample_cols_clipped = np.clip(sample_cols_safe, 0, slave_slc.shape[1] - 2)
         
         row_floor = np.floor(sample_rows_clipped).astype(int)
         col_floor = np.floor(sample_cols_clipped).astype(int)
@@ -1185,8 +1356,18 @@ def process_strip_insar(
         wavelength=wavelength
     )
     
+    temp_dem_dir = None
+    dem_path_to_use = dem_path
+    if _detect_file_type(dem_path) != "h5":
+        temp_dem_dir = tempfile.mkdtemp(prefix="insar_dem_")
+        dem_path_to_use = _ensure_dem_hdf_path(dem_path, temp_dem_dir)
+
     processor = StripInSARProcessor(context, use_gpu=use_gpu)
-    return processor.run(dem_path, stages)
+    try:
+        return processor.run(dem_path_to_use, stages)
+    finally:
+        if temp_dem_dir and os.path.exists(temp_dem_dir):
+            shutil.rmtree(temp_dem_dir, ignore_errors=True)
 
 
 def _detect_file_type(path: str) -> str:
